@@ -110,6 +110,8 @@ private extension VNCConnection {
 		guard settings.isClipboardRedirectionEnabled else { return }
 
 		clipboard.text = text
+
+		notifyDelegateAboutServerCutText(text)
 	}
 
 	func handleBellMessage() async throws {

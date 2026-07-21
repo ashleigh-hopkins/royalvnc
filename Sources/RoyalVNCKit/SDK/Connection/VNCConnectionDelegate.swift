@@ -46,4 +46,14 @@ public protocol VNCConnectionDelegate: AnyObject {
 #endif
 	func connection(_ connection: VNCConnection,
 					didUpdateCursor cursor: VNCCursor)
+
+	// Fired on the connection queue when the server sends clipboard (cut) text and
+	// clipboard redirection is enabled. Optional so existing conformers (the C SDK
+	// bridge, the demo app) compile unchanged; text-only, matching the RFB ClientCutText/
+	// ServerCutText messages RoyalVNCKit supports.
+#if canImport(ObjectiveC)
+    @objc optional
+	func connection(_ connection: VNCConnection,
+					didReceiveServerCutText text: String)
+#endif
 }

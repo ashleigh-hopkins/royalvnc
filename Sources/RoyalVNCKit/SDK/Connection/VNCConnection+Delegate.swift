@@ -34,6 +34,13 @@ extension VNCConnection {
 							 didUpdateCursor: cursor)
 	}
 
+	func notifyDelegateAboutServerCutText(_ text: String) {
+#if canImport(ObjectiveC)
+		delegate?.connection?(self,
+							  didReceiveServerCutText: text)
+#endif
+	}
+
 	func askDelegateForPasswordCredential(authenticationType: VNCAuthenticationType) async throws -> VNCPasswordCredential {
 		guard let passwordCredential = try await askDelegateForCredential(authenticationType: authenticationType) as? VNCPasswordCredential else {
 			throw VNCError.authentication(.noAuthenticationDataProvided)

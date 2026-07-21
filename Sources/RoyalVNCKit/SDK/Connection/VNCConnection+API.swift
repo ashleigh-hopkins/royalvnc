@@ -144,3 +144,16 @@ public extension VNCConnection {
 		keyUp(.init(key))
 	}
 }
+
+// MARK: - Clipboard
+public extension VNCConnection {
+	// Sends the given text to the server as an RFB ClientCutText message (client -> server
+	// clipboard redirection). Enqueues onto the thread-safe client-to-server message queue,
+	// so it is safe to call from the main thread like the mouse/keyboard input APIs.
+#if canImport(ObjectiveC)
+	@objc
+#endif
+	func sendClientCutText(_ text: String) {
+		enqueueClientCutTextMessage(text)
+	}
+}
