@@ -38,8 +38,12 @@ let package = Package(
 
     products: [
         .library(
+            // No explicit `type:` so SwiftPM links this statically into the consuming app by
+            // default. The upstream `.dynamic` product forces a RoyalVNCKit.framework that must be
+            // embedded in the .app; when it is not, device launch crashes with
+            // "Library not loaded: @rpath/RoyalVNCKit.framework/RoyalVNCKit". Static linking avoids
+            // the embed step entirely.
             name: "RoyalVNCKit",
-            type: .dynamic,
             targets: [ "RoyalVNCKit" ]
         ),
 
