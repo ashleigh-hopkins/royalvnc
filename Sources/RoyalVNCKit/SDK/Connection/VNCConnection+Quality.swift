@@ -104,9 +104,11 @@ public extension VNCConnection {
 	/// APIs): the message is enqueued onto the client-to-server message queue and sent by the send
 	/// loop. Has no visible effect until a connection is established.
 	func updateQuality(jpegQualityLevel: Settings.JPEGQualityLevel? = nil,
-					   compressionLevel: Settings.CompressionLevel? = nil) {
+					   compressionLevel: Settings.CompressionLevel? = nil,
+					   frameEncodings: [VNCFrameEncodingType]? = nil) {
 		if let jpegQualityLevel { state.jpegQualityLevel = jpegQualityLevel }
 		if let compressionLevel { state.compressionLevel = compressionLevel }
+		if let frameEncodings { state.frameEncodings = frameEncodings }
 
 		guard connection.isReady,
 			  let encodings = try? orderedEncodingTypes() else { return }

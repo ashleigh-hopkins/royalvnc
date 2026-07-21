@@ -31,6 +31,9 @@ extension VNCConnection {
 		var jpegQualityLevel: VNCConnection.Settings.JPEGQualityLevel = .default
 		var compressionLevel: VNCConnection.Settings.CompressionLevel = .default
 		var wantsContinuousUpdates = false
+		/// Preferred frame encodings. Seeded from Settings.frameEncodings; runtime-adjustable so a
+		/// mid-session SetEncodings can change the preferred encoding order.
+		var frameEncodings: [VNCFrameEncodingType] = []
 	}
 }
 

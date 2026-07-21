@@ -138,8 +138,9 @@ public final class VNCConnection: NSObjectOrAnyObject {
 			VNCFrameEncodingType.copyRect.rawValue
 		]
 
-		// Frame Encodings (Customizable)
-		var customizedFrameEncodings = settings.frameEncodings.map({ $0.rawValue })
+		// Frame Encodings (Customizable; seeded from Settings.frameEncodings, runtime-adjustable
+		// via VNCConnection.updateQuality(frameEncodings:)).
+		var customizedFrameEncodings = state.frameEncodings.map({ $0.rawValue })
 
 		// TODO: Remove once we support ZRLE for non-24-bit pixel formats
 		if let pixelFormat = state.pixelFormat,
@@ -226,6 +227,7 @@ public final class VNCConnection: NSObjectOrAnyObject {
         self.state.jpegQualityLevel = settings.jpegQualityLevel
         self.state.compressionLevel = settings.compressionLevel
         self.state.wantsContinuousUpdates = settings.useContinuousUpdates
+        self.state.frameEncodings = settings.frameEncodings
 
         self.clipboardMonitor.delegate = self
     }
