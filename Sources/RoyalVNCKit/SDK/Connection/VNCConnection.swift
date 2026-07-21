@@ -171,14 +171,19 @@ public final class VNCConnection: NSObjectOrAnyObject {
 			VNCPseudoEncodingType.cursor.rawValue,
 			// TODO: Implement
 //			VNCPseudoEncodingType.extendedClipboard.rawValue,
-            
-            // TODO: Make configurable
-			VNCPseudoEncodingType.compressionLevel6.rawValue
 		])
 
-		if usesTightEncoding {
-            // TODO: Make configurable
-			encs.append(VNCPseudoEncodingType.jpegQualityLevel6.rawValue)
+		// Compression level (configurable; seeded from Settings.compressionLevel, runtime-adjustable
+		// via VNCConnection.updateQuality). `disabled` advertises no compression pseudo-encoding.
+		if let compressionLevelEncoding = state.compressionLevel.pseudoEncodingType {
+			encs.append(compressionLevelEncoding.rawValue)
+		}
+
+		// JPEG quality only applies to Tight encoding (configurable; seeded from
+		// Settings.jpegQualityLevel, runtime-adjustable). `disabled` advertises no JPEG pseudo-encoding.
+		if usesTightEncoding,
+		   let jpegQualityLevelEncoding = state.jpegQualityLevel.pseudoEncodingType {
+			encs.append(jpegQualityLevelEncoding.rawValue)
 		}
 
 		let uniqueEncs = encs.uniqued()
@@ -216,6 +221,11 @@ public final class VNCConnection: NSObjectOrAnyObject {
         self.framebufferAllocator = framebufferAllocator
 
         super.init()
+
+        // Seed runtime-adjustable quality state from Settings.
+        self.state.jpegQualityLevel = settings.jpegQualityLevel
+        self.state.compressionLevel = settings.compressionLevel
+        self.state.wantsContinuousUpdates = settings.useContinuousUpdates
 
         self.clipboardMonitor.delegate = self
     }

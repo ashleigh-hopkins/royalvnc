@@ -135,6 +135,12 @@ private extension VNCConnection {
 			logger.logDebug("Disabling Continuous Updates")
 		}
 
+		// Honour the requested Continuous Updates setting once the server advertises support.
+		// sendEnableContinuousUpdates() no-ops if already enabled or not requested.
+		if state.wantsContinuousUpdates {
+			try await sendEnableContinuousUpdates()
+		}
+
 		try await sendFramebufferUpdateRequest()
 	}
 }

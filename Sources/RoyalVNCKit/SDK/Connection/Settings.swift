@@ -56,6 +56,18 @@ public extension VNCConnection {
 
 		public let frameEncodings: [VNCFrameEncodingType]
 
+		/// Initial JPEG quality level (Tight encoding) advertised to the server. Runtime-adjustable
+		/// via `VNCConnection.updateQuality(jpegQualityLevel:compressionLevel:)`.
+		public let jpegQualityLevel: JPEGQualityLevel
+
+		/// Initial compression level advertised to the server. Runtime-adjustable via
+		/// `VNCConnection.updateQuality(jpegQualityLevel:compressionLevel:)`.
+		public let compressionLevel: CompressionLevel
+
+		/// Whether Continuous Updates should be requested once the server advertises support.
+		/// Runtime-adjustable via `VNCConnection.setContinuousUpdatesEnabled(_:)`.
+		public let useContinuousUpdates: Bool
+
 #if canImport(ObjectiveC)
 		@objc(frameEncodings)
 #endif
@@ -72,7 +84,10 @@ public extension VNCConnection {
 					inputMode: InputMode,
 					isClipboardRedirectionEnabled: Bool,
 					colorDepth: ColorDepth,
-					frameEncodings: [VNCFrameEncodingType]) {
+					frameEncodings: [VNCFrameEncodingType],
+					jpegQualityLevel: JPEGQualityLevel = .default,
+					compressionLevel: CompressionLevel = .default,
+					useContinuousUpdates: Bool = false) {
 			self.isDebugLoggingEnabled = isDebugLoggingEnabled
 
 			self.hostname = hostname
@@ -89,6 +104,10 @@ public extension VNCConnection {
 
 			self.colorDepth = colorDepth
 			self.frameEncodings = frameEncodings
+
+			self.jpegQualityLevel = jpegQualityLevel
+			self.compressionLevel = compressionLevel
+			self.useContinuousUpdates = useContinuousUpdates
 		}
 
 #if canImport(ObjectiveC)

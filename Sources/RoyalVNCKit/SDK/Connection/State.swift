@@ -25,6 +25,12 @@ extension VNCConnection {
 
 		var areContinuousUpdatesSupported = false
 		var areContinuousUpdatesEnabled = false
+
+		// Runtime-adjustable quality state. Seeded from Settings in VNCConnection.init; mutated by
+		// the public quality API and read by orderedEncodingTypes()/the Continuous Updates handshake.
+		var jpegQualityLevel: VNCConnection.Settings.JPEGQualityLevel = .default
+		var compressionLevel: VNCConnection.Settings.CompressionLevel = .default
+		var wantsContinuousUpdates = false
 	}
 }
 
