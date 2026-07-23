@@ -68,6 +68,12 @@ public extension VNCConnection {
 		/// Runtime-adjustable via `VNCConnection.setContinuousUpdatesEnabled(_:)`.
 		public let useContinuousUpdates: Bool
 
+		/// Whether to optimistically enable Continuous Updates (T1 Change A) — send
+		/// `EnableContinuousUpdates` without waiting for the server to advertise support, to probe a
+		/// server (e.g. Apple's Standard server) that never sends `EndOfContinuousUpdates`. Default
+		/// `false`; connect-time only. A one-shot watchdog reverts to polling if no frames arrive.
+		public let useOptimisticContinuousUpdates: Bool
+
 #if canImport(ObjectiveC)
 		@objc(frameEncodings)
 #endif
@@ -87,7 +93,8 @@ public extension VNCConnection {
 					frameEncodings: [VNCFrameEncodingType],
 					jpegQualityLevel: JPEGQualityLevel = .default,
 					compressionLevel: CompressionLevel = .default,
-					useContinuousUpdates: Bool = false) {
+					useContinuousUpdates: Bool = false,
+					useOptimisticContinuousUpdates: Bool = false) {
 			self.isDebugLoggingEnabled = isDebugLoggingEnabled
 
 			self.hostname = hostname
@@ -108,6 +115,7 @@ public extension VNCConnection {
 			self.jpegQualityLevel = jpegQualityLevel
 			self.compressionLevel = compressionLevel
 			self.useContinuousUpdates = useContinuousUpdates
+			self.useOptimisticContinuousUpdates = useOptimisticContinuousUpdates
 		}
 
 #if canImport(ObjectiveC)

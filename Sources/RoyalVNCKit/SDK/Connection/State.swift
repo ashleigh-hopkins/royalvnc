@@ -26,6 +26,14 @@ extension VNCConnection {
 		var areContinuousUpdatesSupported = false
 		var areContinuousUpdatesEnabled = false
 
+		// Optimistic Continuous Updates (T1 Change A). Probes whether a server that never advertises CU
+		// support (e.g. Apple's Standard server) still honours an unsolicited EnableContinuousUpdates.
+		var wantsOptimisticContinuousUpdates = false
+		var optimisticCUActive = false
+		/// Monotonic count of received FramebufferUpdate messages. Feeds the optimistic-CU watchdog
+		/// (no wall/uptime clock needed). Only ever mutated under `stateLock` via noteFramebufferUpdateReceived().
+		var framebufferUpdateCount: UInt64 = 0
+
 		// Runtime-adjustable quality state. Seeded from Settings in VNCConnection.init; mutated by
 		// the public quality API and read by orderedEncodingTypes()/the Continuous Updates handshake.
 		var jpegQualityLevel: VNCConnection.Settings.JPEGQualityLevel = .default

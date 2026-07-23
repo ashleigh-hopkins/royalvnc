@@ -97,6 +97,16 @@ let package = Package(
         .executableTarget(
             name: "RoyalVNCKitCDemo",
             dependencies: [ "RoyalVNCKit" ]
+        ),
+
+        // T1 A-F: pure state/decision-core unit tests. Exercises only `state` + `stateLock` + `Queue`
+        // (never the non-injectable NetworkConnection socket), so it is compilable and hermetic.
+        .testTarget(
+            name: "RoyalVNCKitTests",
+            dependencies: [ "RoyalVNCKit" ],
+            swiftSettings: [
+                .swiftLanguageMode(swiftLanguageMode)
+            ]
         )
     ]
 )

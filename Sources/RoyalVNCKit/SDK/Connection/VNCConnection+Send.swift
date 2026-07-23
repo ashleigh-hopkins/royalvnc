@@ -23,7 +23,7 @@ extension VNCConnection {
 
 	func sendFramebufferUpdateRequest() async throws {
 		guard let framebuffer,
-              !state.areContinuousUpdatesEnabled else {
+              !continuousUpdatesEnabledLocked() else {
             return
         }
         
@@ -44,7 +44,7 @@ extension VNCConnection {
 	func sendEnableContinuousUpdates() async throws {
 		guard let framebuffer,
               state.areContinuousUpdatesSupported,
-              !state.areContinuousUpdatesEnabled else {
+              !continuousUpdatesEnabledLocked() else {
             return
         }
 
@@ -54,7 +54,30 @@ extension VNCConnection {
 		try await sendEnableContinuousUpdates(enable: true,
 											  region: fullFramebufferRegion)
 
+		setContinuousUpdatesEnabledLocked(true)
+	}
+
+	/// Enable Continuous Updates optimistically — WITHOUT the areContinuousUpdatesSupported guard —
+	/// to probe a server (e.g. Apple's Standard server) that never advertises support via
+	/// EndOfContinuousUpdates. Deliberately does not send an initial polling request: a compliant
+	/// server streams in response to the enable region; a non-compliant one leaves framebufferUpdateCount
+	/// at 0, which the watchdog detects. (T1 Change A.)
+	func sendOptimisticEnableContinuousUpdates() async throws {
+		guard let framebuffer,
+              !continuousUpdatesEnabledLocked() else {
+            return
+        }
+
+		let region = VNCRegion(location: .zero,
+							   size: framebuffer.size)
+
+		try await sendEnableContinuousUpdates(enable: true,
+											  region: region)
+
+		stateLock.lock()
 		state.areContinuousUpdatesEnabled = true
+		state.optimisticCUActive = true
+		stateLock.unlock()
 	}
 }
 

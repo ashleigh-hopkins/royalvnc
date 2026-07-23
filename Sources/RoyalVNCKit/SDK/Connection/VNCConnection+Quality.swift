@@ -123,25 +123,41 @@ public extension VNCConnection {
 	/// per-frame request loop. No effect if the server has not advertised Continuous Updates support.
 	func setContinuousUpdatesEnabled(_ enabled: Bool) {
 		state.wantsContinuousUpdates = enabled
+		guard connection.isReady, let framebuffer else { return }
 
-		guard connection.isReady,
-			  state.areContinuousUpdatesSupported,
-			  let framebuffer else { return }
+		// T1 Change A: optimistic CU has no server-advertised support, so allow the disable/enable
+		// through when the optimistic probe is active even though areContinuousUpdatesSupported is false.
+		stateLock.lock(); let optimistic = state.optimisticCUActive; stateLock.unlock()
+		guard state.areContinuousUpdatesSupported || optimistic else { return }
 
 		let region = VNCRegion(location: .zero, size: framebuffer.size)
-		let message = VNCProtocol.EnableContinuousUpdates(enable: enabled,
-														  xPosition: region.x,
-														  yPosition: region.y,
-														  width: region.width,
-														  height: region.height)
+		clientToServerMessageQueue.enqueue(VNCProtocol.EnableContinuousUpdates(
+			enable: enabled, xPosition: region.x, yPosition: region.y,
+			width: region.width, height: region.height))
 
-		clientToServerMessageQueue.enqueue(message)
-
-		// Enabling stops the per-frame request loop immediately (the send guard checks this flag).
-		// Disabling is finalized when the server replies with EndOfContinuousUpdates, which resets
-		// the flag and resumes the request loop.
 		if enabled {
-			state.areContinuousUpdatesEnabled = true
+			// Enabling stops the per-frame request loop immediately (the send guard checks this flag).
+			setContinuousUpdatesEnabledLocked(true)
+		} else {
+			// Genuine CU is finalized when the server replies with EndOfContinuousUpdates. Optimistic CU
+			// has no such round-trip, so tear it down now and resume polling.
+			stateLock.lock()
+			let wasOptimistic = state.optimisticCUActive
+			state.optimisticCUActive = false
+			if wasOptimistic { state.areContinuousUpdatesEnabled = false }
+			stateLock.unlock()
+			if wasOptimistic { cancelContinuousUpdatesWatchdog() }
 		}
+	}
+
+	/// Request a one-shot non-incremental full-framebuffer update. Legal even while Continuous Updates
+	/// are active; used to repaint a static remote or a texture cleared while backgrounded (T1 Change E).
+	func refreshFullFramebuffer() {
+		guard connection.isReady, let framebuffer else { return }
+		let region = VNCRegion(location: .zero, size: framebuffer.size)
+		clientToServerMessageQueue.enqueue(VNCProtocol.FramebufferUpdateRequest(
+			incremental: false,
+			xPosition: region.x, yPosition: region.y,
+			width: region.width, height: region.height))
 	}
 }

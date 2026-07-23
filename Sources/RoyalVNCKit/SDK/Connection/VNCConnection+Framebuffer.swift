@@ -58,5 +58,19 @@ extension VNCConnection {
 		self.framebuffer = newFramebuffer
 
 		notifyDelegateAboutFramebufferResize(newFramebuffer)
+
+		// T1 Change E: if Continuous Updates are active (optimistic or genuine), the server's continuous
+		// region was fixed to the OLD geometry at enable time. Re-issue EnableContinuousUpdates for the
+		// new region and solicit one full frame so the newly exposed area streams. (A plain
+		// FramebufferUpdateRequest would no-op under CU.)
+		if continuousUpdatesEnabledLocked() {
+			let region = VNCRegion(location: .zero, size: newFramebuffer.size)
+			clientToServerMessageQueue.enqueue(VNCProtocol.EnableContinuousUpdates(
+				enable: true, xPosition: region.x, yPosition: region.y,
+				width: region.width, height: region.height))
+			clientToServerMessageQueue.enqueue(VNCProtocol.FramebufferUpdateRequest(
+				incremental: false, xPosition: region.x, yPosition: region.y,
+				width: region.width, height: region.height))
+		}
 	}
 }

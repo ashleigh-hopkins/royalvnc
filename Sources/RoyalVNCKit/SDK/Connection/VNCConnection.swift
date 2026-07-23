@@ -57,6 +57,19 @@ public final class VNCConnection: NSObjectOrAnyObject {
 	var receiveTask: Task<(), Error>?
 	var sendTask: Task<(), Error>?
 
+	// T1: guards the fields that Change A/B make genuinely cross-task (the receive loop, the send loop,
+	// the main-thread quality API, and the one-shot watchdog task all touch them). This is the SOLE
+	// access path for `state.areContinuousUpdatesEnabled`, `state.optimisticCUActive`,
+	// `state.framebufferUpdateCount`, and `continuousUpdatesWatchdogTask`
+	// (see VNCConnection+ContinuousUpdatesWatchdog.swift for the accessors).
+	let stateLock = NSLock()
+	var continuousUpdatesWatchdogTask: Task<Void, Never>?
+	/// Latched (under stateLock) the first time the watchdog is cancelled — including by
+	/// beginDisconnecting. Ensures a watchdog whose arm() loses the race against a concurrent
+	/// disconnect (cancel runs before the task is stored) is still torn down, never outliving the
+	/// connection. VNCConnection is single-use per connect, so a permanent latch is correct.
+	var continuousUpdatesWatchdogTornDown = false
+
 	let maxSupportedProtocolVersion = VNCProtocol.ProtocolVersion(majorVersion: 3,
 																  minorVersion: 8)
 
@@ -227,6 +240,7 @@ public final class VNCConnection: NSObjectOrAnyObject {
         self.state.jpegQualityLevel = settings.jpegQualityLevel
         self.state.compressionLevel = settings.compressionLevel
         self.state.wantsContinuousUpdates = settings.useContinuousUpdates
+        self.state.wantsOptimisticContinuousUpdates = settings.useOptimisticContinuousUpdates
         self.state.frameEncodings = settings.frameEncodings
 
         self.clipboardMonitor.delegate = self
@@ -306,6 +320,10 @@ extension VNCConnection {
 		connection.setStatusUpdateHandler(nil)
 		connection.cancel()
 
+		// T1 Change A: the optimistic-CU watchdog must never outlive the connection. The helper is
+		// lock-guarded, so cancelling here (from main / receive / send) is safe.
+		cancelContinuousUpdatesWatchdog()
+
 		if let error = error {
 			updateConnectionState(.disconnected(error: error))
 		} else {
@@ -377,7 +395,17 @@ private extension VNCConnection {
 		Task {
 			do {
 				try await handshake()
-				try await sendFramebufferUpdateRequest()
+
+				// T1 Change A: in optimistic mode, enable Continuous Updates WITHOUT the support guard
+				// and WITHOUT an initial polling request — the enable region solicits the first frame,
+				// and a server that ignores msg 150 leaves framebufferUpdateCount at 0 so the watchdog
+				// reverts to polling. (`wantsOptimisticContinuousUpdates` is set once in init and never
+				// mutated, so this read is race-free.)
+				if state.wantsOptimisticContinuousUpdates {
+					try await sendOptimisticEnableContinuousUpdates()
+				} else {
+					try await sendFramebufferUpdateRequest()
+				}
 			} catch {
 				handleBreakingError(error)
 
@@ -388,6 +416,11 @@ private extension VNCConnection {
 
 			startReceiveLoop()
 			startSendLoop()
+
+			stateLock.lock()
+			let armWatchdog = state.optimisticCUActive
+			stateLock.unlock()
+			if armWatchdog { armContinuousUpdatesWatchdog() }
 		}
 	}
 

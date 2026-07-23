@@ -19,6 +19,12 @@ public extension VNCConnection {
 	func disconnect() {
 		beginDisconnecting()
 	}
+
+	/// Whether the underlying network connection currently has a live socket. Distinct from
+	/// `connectionState` (which is updated via the delegate hop and can lag): this reflects the live
+	/// transport. Used by the app's foreground-recovery decision (T1 Change E) to tell a genuinely
+	/// live `.connected` session (repaint) from a stale one whose socket has dropped (reconnect/none).
+	var isReady: Bool { connection.isReady }
 }
 
 public extension VNCConnection {
