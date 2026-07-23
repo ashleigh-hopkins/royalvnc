@@ -8,7 +8,17 @@ extension VNCConnection {
 	func startMonitoringClipboard() {
 		guard settings.isClipboardRedirectionEnabled else { return }
 
+#if canImport(UIKit)
+		// iOS/tvOS/visionOS/Catalyst: the monitor's only way to detect a local clipboard change is to
+		// read UIPasteboard's CONTENT (`.string`), which triggers the system "Allow Paste" prompt on
+		// every poll. Auto-polling therefore spams the prompt and wedges the UI. Clients on these
+		// platforms send the clipboard EXPLICITLY (user-initiated, via `sendClientCutText`) instead;
+		// the server -> client receive path (didReceiveServerCutText) is unaffected. See the app's
+		// VNCSessionController.sendLocalClipboardToRemote.
+		_ = clipboardMonitor   // keep the property referenced; no auto-poll on this platform
+#else
 		clipboardMonitor.startMonitoring()
+#endif
 	}
 
 	func stopMonitoringClipboard() {
