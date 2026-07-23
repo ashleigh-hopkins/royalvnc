@@ -40,7 +40,15 @@ extension BigNum {
 
     func rand(range: BigNum) -> Bool {
         self.bigInt = CS.BigUInt.randomInteger(lessThan: range.bigInt)
-        
+
+        return true
+    }
+
+    /// Generates a cryptographically-random value of exactly `width` bits (top bit set, so the
+    /// result is always non-zero and exactly `width` bits wide). Used for short DH exponents.
+    func rand(exactWidth width: Int) -> Bool {
+        self.bigInt = CS.BigUInt.randomInteger(withExactWidth: width)
+
         return true
     }
 
