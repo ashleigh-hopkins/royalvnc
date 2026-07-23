@@ -83,22 +83,39 @@ public final class VNCConnection: NSObjectOrAnyObject {
 
     var mouseButtonState: VNCProtocol.MousePointerButton = [ ]
 
-    lazy var connection: some NetworkConnection = {
+    // HP-SPECS §4.2: an existential (`any`) rather than an opaque `some`, so the HP path can wrap the
+    // base in `AppleRecordLayerConnection` while the standard path stays the bare base type. When HP is
+    // OFF the returned object IS the bare base — byte-identical to before (AC-5); the record-layer
+    // decorator is never inserted. R5 throughput gate (AC-7, <2% regression) is checked at validation.
+    lazy var connection: any NetworkConnection = {
         let connectionSettings = NetworkConnectionSettings(connectionTimeout: 15,
                                                            host: settings.hostname,
                                                            port: settings.port)
 
         // NOTE: To test SocketNetworkConnection on Darwin (macOS, iOS, etc.), comment out the the #if
 #if canImport(Network)
-        let connection = NWConnection(settings: connectionSettings)
+        let base = NWConnection(settings: connectionSettings)
 #else
-		let connection = SocketNetworkConnection(settings: connectionSettings)
+		let base = SocketNetworkConnection(settings: connectionSettings)
 #endif
+
+        let connection: any NetworkConnection
+        if settings.enableHighPerformance {
+            // Wrap in passthrough mode at creation; the handshake flips it to CBC after the 0x44f rekey.
+            connection = AppleRecordLayerConnection(base: base)
+        } else {
+            connection = base
+        }
 
         connection.setStatusUpdateHandler(connectionStatusDidChange)
 
 		return connection
 	}()
+
+	/// Transient holder for the record-layer wrap key derived by the HP RSA-SRP auth (HP-SPECS §5.2),
+	/// carried from auth to the point where the `0x44f` rekey is read and the record layer is armed.
+	/// Cleared immediately after arming (NFR-6). `nil` on the standard path.
+	var appleHPWrapKey: Data?
 
 	lazy var encodings: Encodings = {
 		let rawEncoding = VNCProtocol.RawEncoding()

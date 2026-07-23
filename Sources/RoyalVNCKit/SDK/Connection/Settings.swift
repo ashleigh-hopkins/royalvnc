@@ -74,6 +74,17 @@ public extension VNCConnection {
 		/// `false`; connect-time only. A one-shot watchdog reverts to polling if no frames arrive.
 		public let useOptimisticContinuousUpdates: Bool
 
+		/// Opt-in to the Apple High-Performance control path (HP-SPECS §2, Q1). Default `false`.
+		///
+		/// When `false` (the default) the client is byte-for-byte identical to the standard RFB path:
+		/// the `RFB 003.889` banner is never sent, Apple security type 33 is never selected even if the
+		/// server offers it, and the connection object is a bare `NetworkConnection` (no record-layer
+		/// decorator). When `true` against an Apple Remote Desktop host, the client sends `003.889`,
+		/// selects type 33 (RSA-SRP), and arms the AES-128-CBC control record layer after the `0x44f`
+		/// rekey. Auto-detect is deliberately rejected (it would regress standard servers that offer
+		/// `003.889` or type-33-over-TLS). Connect-time only.
+		public let enableHighPerformance: Bool
+
 #if canImport(ObjectiveC)
 		@objc(frameEncodings)
 #endif
@@ -94,7 +105,8 @@ public extension VNCConnection {
 					jpegQualityLevel: JPEGQualityLevel = .default,
 					compressionLevel: CompressionLevel = .default,
 					useContinuousUpdates: Bool = false,
-					useOptimisticContinuousUpdates: Bool = false) {
+					useOptimisticContinuousUpdates: Bool = false,
+					enableHighPerformance: Bool = false) {
 			self.isDebugLoggingEnabled = isDebugLoggingEnabled
 
 			self.hostname = hostname
@@ -116,6 +128,7 @@ public extension VNCConnection {
 			self.compressionLevel = compressionLevel
 			self.useContinuousUpdates = useContinuousUpdates
 			self.useOptimisticContinuousUpdates = useOptimisticContinuousUpdates
+			self.enableHighPerformance = enableHighPerformance
 		}
 
 #if canImport(ObjectiveC)
