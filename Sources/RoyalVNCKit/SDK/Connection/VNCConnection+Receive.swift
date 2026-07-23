@@ -74,17 +74,14 @@ private extension VNCConnection {
 		// (C invariant) inflate + pixel-convert + surface-write run serially on this receiveTask: the
 		// shared stateful zlib streams (sharedZStream/sharedZRLEZStream) and the in-order byte cursor
 		// forbid parallel/out-of-order decode. Render is already off-loop (snapshotRegion memcpy on the
-		// connection queue, then main.async Metal upload). Surface double-buffering is rejected
-		// (CopyRect/incremental need the persistent previous-frame surface).
+		// connection queue, then main.async Metal upload).
 		//
-		// (B) When Continuous Updates are OFF, put the next request on the wire BEFORE decoding so the
-		// decode overlaps the round-trip. Capture the framebuffer identity so a mid-decode resize/format
-		// change (which swaps self.framebuffer) is corrected afterwards.
-		let willPipeline = !continuousUpdatesEnabledLocked()
-		if willPipeline {
-			try await sendFramebufferUpdateRequest()
-		}
-
+		// NOTE: Change B (pipeline the next FramebufferUpdateRequest BEFORE decode) was REVERTED after
+		// on-device testing (2026-07-23). Sending the next request while the server was still mid-
+		// transmitting the current update's body made Apple's screensharingd eventually stop responding
+		// (device-confirmed stall: our loop kept requesting perfectly, server went silent on a changing
+		// screen). B also produced no fps gain on-device (~5-7 fps, RTT-bound). Restore the original
+		// serial order: fully read+decode this update, THEN request the next.
 		let framebufferUpdate = try await VNCProtocol.FramebufferUpdate.receive(connection: connection,
 																				framebuffer: framebuffer,
 																				encodings: encodings,
@@ -97,15 +94,7 @@ private extension VNCConnection {
 		try framebuffer.writeSurface()
 		*/
 
-		// Resize/format-change race guard: DesktopSize/ExtendedDesktopSize pseudo-rects (and a client
-		// updateColorDepth) call recreateFramebuffer, which resets incrementalUpdatesEnabled=false and
-		// SWAPS self.framebuffer. A request pipelined before decode used the OLD geometry + incremental=true.
-		// If the framebuffer instance changed, emit a corrective request — recreateFramebuffer already
-		// reset incrementalUpdatesEnabled, so it goes out non-incremental full-frame at the NEW geometry.
-		let replaced = (self.framebuffer !== framebuffer)
-		if !willPipeline || replaced {
-			try await sendFramebufferUpdateRequest()
-		}
+		try await sendFramebufferUpdateRequest()
 	}
 
 	func handleSetColourMapEntriesMessage() async throws {
