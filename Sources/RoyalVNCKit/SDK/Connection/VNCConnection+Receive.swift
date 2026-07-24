@@ -57,6 +57,13 @@ private extension VNCConnection {
 			case VNCProtocol.EndOfContinuousUpdates.messageType:
 				try await handleEndOfContinuousUpdatesMessage()
 
+			// T12: Apple in-protocol clipboard over the type-33 control channel (HP-gated inside).
+			case AppleClipboardCodec.msgMiscStatus:
+				try await handleAppleMiscStatusMessage()
+
+			case AppleClipboardCodec.msgClipboardSend:
+				try await handleAppleClipboardSendMessage()
+
 			default:
 				throw VNCError.protocol(.unsupportedServerToClientMessage(messageType: messageType))
 		}

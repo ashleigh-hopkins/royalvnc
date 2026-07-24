@@ -9,6 +9,10 @@ extension VNCConnection {
 	func startSendLoop() {
         logger.logDebug("Starting send loop")
 
+		// T12: seed the Apple in-protocol clipboard (0x15 enable + prime 0x0b fetch) as the first
+		// client→server records. No-op unless HP + clipboard redirection are on (record layer active).
+		enqueueAppleClipboardBringUpIfNeeded()
+
 		sendTask = Task(priority: taskPriority) {
 			while !state.disconnectRequested,
                   connection.isReady {

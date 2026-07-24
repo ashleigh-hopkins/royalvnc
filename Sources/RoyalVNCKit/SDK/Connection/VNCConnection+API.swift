@@ -153,13 +153,22 @@ public extension VNCConnection {
 
 // MARK: - Clipboard
 public extension VNCConnection {
-	// Sends the given text to the server as an RFB ClientCutText message (client -> server
-	// clipboard redirection). Enqueues onto the thread-safe client-to-server message queue,
-	// so it is safe to call from the main thread like the mouse/keyboard input APIs.
+	// Sends the given text to the server for client -> server clipboard redirection. Enqueues onto the
+	// thread-safe client-to-server message queue, so it is safe to call from the main thread like the
+	// mouse/keyboard input APIs.
+	//
+	// T12: in High Performance mode the standard RFB `ClientCutText` (`0x06`) is a dead end against
+	// macOS screensharingd (it only writes the legacy latin-1 scrap). So HP sessions route to Apple's
+	// rich `0x1f` ClipboardSend instead (`sendAppleClipboardText`). Non-HP sessions are unchanged. This
+	// keeps callers (the app) transport-agnostic — they always call `sendClientCutText`.
 #if canImport(ObjectiveC)
 	@objc
 #endif
 	func sendClientCutText(_ text: String) {
-		enqueueClientCutTextMessage(text)
+		if settings.enableHighPerformance {
+			sendAppleClipboardText(text)
+		} else {
+			enqueueClientCutTextMessage(text)
+		}
 	}
 }
