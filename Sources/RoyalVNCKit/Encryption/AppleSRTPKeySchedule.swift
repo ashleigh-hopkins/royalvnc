@@ -26,11 +26,14 @@ enum AppleSRTPKeySchedule {
     static let masterSaltLen = 14
     static let blobLen = 46          // masterKeyLen + masterSaltLen
 
-    /// RTP KDF labels (crib §3b). RTCP uses 3/4/5.
+    /// KDF labels (crib §3b): RTP 0/1/2, RTCP 3/4/5.
     enum Label: UInt8 {
         case rtpEncryption = 0
         case rtpAuthentication = 1
         case rtpSalt = 2
+        case rtcpEncryption = 3
+        case rtcpAuthentication = 4
+        case rtcpSalt = 5
     }
 
     /// Session key sizes (crib §3b).
@@ -64,6 +67,19 @@ enum AppleSRTPKeySchedule {
                                     label: .rtpAuthentication, outLen: sessionAuthLen),
             salt: try kdf(masterKey: masterKey, masterSalt: masterSalt,
                           label: .rtpSalt, outLen: sessionSaltLen))
+    }
+
+    /// Derive the three RTCP session keys from a master blob (crib §3b/§3h, labels 3/4/5). Same
+    /// sizes as RTP. Used by `AppleSRTCPProtector` to encrypt/authenticate outbound RTCP.
+    static func deriveRTCPSessionKeys(blob: Data) throws -> SessionKeys {
+        let (masterKey, masterSalt) = try split(blob: blob)
+        return SessionKeys(
+            encryption: try kdf(masterKey: masterKey, masterSalt: masterSalt,
+                                label: .rtcpEncryption, outLen: sessionEncLen),
+            authentication: try kdf(masterKey: masterKey, masterSalt: masterSalt,
+                                    label: .rtcpAuthentication, outLen: sessionAuthLen),
+            salt: try kdf(masterKey: masterKey, masterSalt: masterSalt,
+                          label: .rtcpSalt, outLen: sessionSaltLen))
     }
 
     /// RFC-3711 AES-CM KDF with an AES-256 PRF (crib §3b).
@@ -105,6 +121,36 @@ enum AppleSRTPKeySchedule {
             throw VNCError.protocol(.invalidData)
         }
         return sessionSalt + Data([0x00, 0x00])
+    }
+
+    // MARK: - Shared AES-CTR initial counter (SRTP + SRTCP)
+
+    /// Build the 16-byte AES-CTR initial counter shared by SRTP and SRTCP (crib §3d/§3h,
+    /// RFC 3711 §4.1.1): `IV = salt_int XOR (ssrc<<64) XOR (index<<16)`. `index` is the 48-bit RTP
+    /// packet index `((roc<<16)|seq)` or the 32-bit SRTCP index — both land in the low 64-bit word.
+    /// The low 16 bits (bytes 14-15) stay 0: the AES-CTR block counter starts there.
+    ///
+    /// Computed on the 128-bit value split into two `UInt64` halves so the byte positions follow
+    /// the arithmetic exactly (`ssrc` → bytes 4-7, `index` → bytes 8-13 for RTP / 10-13 for SRTCP).
+    static func counterBlock(saltIV16: [UInt8], ssrc: UInt32, index: UInt64) -> [UInt8] {
+        precondition(saltIV16.count == 16, "CTR salt IV must be 16 bytes")
+        var hi = beUInt64(saltIV16, offset: 0)   // bytes 0-7  (bits 64-127)
+        var lo = beUInt64(saltIV16, offset: 8)   // bytes 8-15 (bits 0-63)
+        hi ^= UInt64(ssrc)                       // ssrc<<64 → high word bits 64-95
+        lo ^= index << 16                        // index<<16 → low word bits 16-63
+        return beBytes64(hi) + beBytes64(lo)
+    }
+
+    private static func beUInt64(_ bytes: [UInt8], offset: Int) -> UInt64 {
+        var v: UInt64 = 0
+        for i in 0..<8 { v = (v << 8) | UInt64(bytes[offset + i]) }
+        return v
+    }
+
+    private static func beBytes64(_ value: UInt64) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: 8)
+        for i in 0..<8 { out[i] = UInt8((value >> (8 * (7 - i))) & 0xFF) }
+        return out
     }
 
     // MARK: - AES-256-ECB single block (no padding) — the KDF PRF

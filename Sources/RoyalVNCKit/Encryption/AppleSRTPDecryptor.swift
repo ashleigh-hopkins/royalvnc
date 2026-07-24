@@ -141,7 +141,9 @@ final class AppleSRTPDecryptor {
         // empty input, so short-circuit rather than construct a cipher over nothing.
         guard !cipherBody.isEmpty else { return Data() }
 
-        let iv = counterBlock(ssrc: ssrc, seq: seq, roc: roc)
+        // RTP packet index is 48-bit: (roc<<16) | seq.
+        let index = (UInt64(roc) << 16) | UInt64(seq)
+        let iv = AppleSRTPKeySchedule.counterBlock(saltIV16: saltIV, ssrc: ssrc, index: index)
         do {
             let aes = try AES(key: Array(sessionKeys.encryption),
                               blockMode: CTR(iv: iv),
@@ -152,40 +154,10 @@ final class AppleSRTPDecryptor {
         }
     }
 
-    /// Build the 16-byte AES-CTR initial counter: `IV = salt_int XOR (ssrc<<64) XOR (index<<16)`,
-    /// `index = (roc<<16) | seq` (crib §3d). Computed on the 128-bit integer split into two u64
-    /// halves so the byte positions follow the arithmetic exactly (ssrc → bytes 4-7, index →
-    /// bytes 8-13, low 16 bits = CTR block counter starting at 0).
-    private func counterBlock(ssrc: UInt32, seq: UInt16, roc: UInt32) -> [UInt8] {
-        var hi = beUInt64(saltIV, offset: 0)   // bytes 0-7  (bits 64-127)
-        var lo = beUInt64(saltIV, offset: 8)   // bytes 8-15 (bits 0-63)
-
-        // ssrc << 64 lands entirely in the high word (bits 64-95).
-        hi ^= UInt64(ssrc)
-
-        // index << 16 lands entirely in the low word (bits 16-63); 48-bit index ⇒ no overflow.
-        let index = (UInt64(roc) << 16) | UInt64(seq)
-        lo ^= index << 16
-
-        return beBytes64(hi) + beBytes64(lo)
-    }
-
     // MARK: - Byte helpers
 
     private func bigEndian32(_ value: UInt32) -> [UInt8] {
         [UInt8(value >> 24 & 0xFF), UInt8(value >> 16 & 0xFF),
          UInt8(value >> 8 & 0xFF), UInt8(value & 0xFF)]
-    }
-
-    private func beUInt64(_ bytes: [UInt8], offset: Int) -> UInt64 {
-        var v: UInt64 = 0
-        for i in 0..<8 { v = (v << 8) | UInt64(bytes[offset + i]) }
-        return v
-    }
-
-    private func beBytes64(_ value: UInt64) -> [UInt8] {
-        var out = [UInt8](repeating: 0, count: 8)
-        for i in 0..<8 { out[i] = UInt8((value >> (8 * (7 - i))) & 0xFF) }
-        return out
     }
 }

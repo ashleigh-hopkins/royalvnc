@@ -86,4 +86,33 @@ final class AppleSRTPKeyScheduleTests: XCTestCase {
         let viaRaw = try AppleSRTPKeySchedule.kdf(masterKey: k, masterSalt: s, label: 0, outLen: 32)
         XCTAssertEqual(viaEnum, viaRaw)
     }
+
+    // Independent RFC-3711 AES-256-CM KDF outputs for the RTCP labels 3/4/5 (same master blob).
+    private let expRtcpEnc  = "b4ccd705fe68c18c06e02a7ce98c4af24784ebe5a2ae870227cccc8306be4d6a"
+    private let expRtcpAuth = "605e45efed987830de49b9db3c075ec577bab3d7"
+    private let expRtcpSalt = "c2ecbb95c52ed3823e9db3d22616"
+
+    /// Byte-exact KAT for the RTCP session keys (KDF labels 3/4/5) vs the independent Python KDF.
+    func testRTCPKDFKnownAnswer() throws {
+        let keys = try AppleSRTPKeySchedule.deriveRTCPSessionKeys(blob: blob)
+        XCTAssertEqual(keys.encryption, hex(expRtcpEnc), "KDF label 3 (RTCP enc, 32 B)")
+        XCTAssertEqual(keys.authentication, hex(expRtcpAuth), "KDF label 4 (RTCP auth, 20 B)")
+        XCTAssertEqual(keys.salt, hex(expRtcpSalt), "KDF label 5 (RTCP salt, 14 B)")
+    }
+
+    func testRTPvsRTCPKeysDiffer() throws {
+        let rtp = try AppleSRTPKeySchedule.deriveRTPSessionKeys(blob: blob)
+        let rtcp = try AppleSRTPKeySchedule.deriveRTCPSessionKeys(blob: blob)
+        XCTAssertNotEqual(rtp.encryption, rtcp.encryption, "labels 0 vs 3 differ")
+        XCTAssertNotEqual(rtp.authentication, rtcp.authentication, "labels 1 vs 4 differ")
+        XCTAssertNotEqual(rtp.salt, rtcp.salt, "labels 2 vs 5 differ")
+    }
+
+    /// The shared AES-CTR counter block: `IV = salt_int ^ (ssrc<<64) ^ (index<<16)`. With a zero
+    /// salt, ssrc=1 lands in byte 7 and index=1 lands in byte 13 (both `<<16`/`<<64` exact).
+    func testCounterBlockZeroSalt() {
+        let iv = AppleSRTPKeySchedule.counterBlock(saltIV16: [UInt8](repeating: 0, count: 16),
+                                                   ssrc: 0x0000_0001, index: 0x0000_0001)
+        XCTAssertEqual(Data(iv), hex("00000000000000010000000000010000"))
+    }
 }
