@@ -58,10 +58,11 @@ extension VNCConnection {
         logger.logDebug("[hp-media] built 0x1c offer (\(offer.count) B) videoSSRC=\(ssrcs?.video ?? 0) audioSSRC=\(ssrcs?.audio ?? 0)")
 
         // Bind the two UDP media sockets + start the NAT-prime loop BEFORE the offer (NFR-8): the
-        // media burst lands ~100 ms after the answer, so the receivers must already be up.
+        // media burst lands ~100 ms after the answer, so the receivers must already be up. The
+        // receiver runs in the background (its own dispatch queues) and is retained on the connection
+        // once negotiation succeeds; cancelled here only if negotiation fails.
         #if canImport(Network)
         let media = try startMediaReceive(videoKeyS: vks)
-        defer { media?.cancel() }
         #endif
 
         // Send 0x1c offer, then the FramebufferUpdateRequest 0x03 (10 B) that wakes the daemon's
@@ -92,14 +93,17 @@ extension VNCConnection {
             try await connection.write(data: Data(fbu09))
             logger.logDebug("[hp-media] sent AutoFrameBufferUpdate 0x09 (\(canvas.width)x\(canvas.height))")
 
-            // Observe the media stream: log decrypted RTP as it arrives (the Phase-4 "done" signal).
+            // Retain the receiver for the life of the connection: video → SRTP decrypt → RTP log runs
+            // in the background, and the RTCP keep-alive loop keeps AVConference streaming past ~30s.
             #if canImport(Network)
             if let media {
-                for _ in 0..<20 {
-                    try await Task.sleep(nanoseconds: 1_000_000_000)
-                    logger.logDebug("[hp-media] rx: video-datagrams=\(media.stats.videoCount) decrypted-rtp=\(media.stats.decryptedCount) ctrl-datagrams=\(media.stats.ctrlCount)")
-                }
+                media.startRTCPKeepAlive(videoKeyV: vkv, senderSSRC: ssrcs?.video ?? 0, logger: logger)
+                appleHPMediaReceiver = media
             }
+            #endif
+        } else {
+            #if canImport(Network)
+            media?.cancel()   // negotiation never produced a canvas — don't leak sockets
             #endif
         }
 
@@ -146,16 +150,62 @@ extension VNCConnection {
         func addCtrl() { lock.lock(); _ctrl += 1; lock.unlock() }
     }
 
-    /// Owns the two UDP media sockets for the receive window.
+    /// Owns the two UDP media sockets + the RTCP keep-alive loop for the life of the connection.
     final class MediaReceiver {
         let stats = MediaStats()
         let videoUDP: AppleUDPDatagramConnection
         let ctrlUDP: AppleUDPDatagramConnection
+        private let rtcpQueue = DispatchQueue(label: "hp.rtcp.tx")
+        private var rtcpTimer: DispatchSourceTimer?
+
         init(videoUDP: AppleUDPDatagramConnection, ctrlUDP: AppleUDPDatagramConnection) {
             self.videoUDP = videoUDP
             self.ctrlUDP = ctrlUDP
         }
-        func cancel() { videoUDP.cancel(); ctrlUDP.cancel() }
+
+        /// Start the 0.5 s RTCP TX keep-alive out the ctrl socket (crib §4g): SRTCP-protected empty RR
+        /// each tick + empty SR every 5 s + a legacy-FIR (PT=192) periodically. Keeps AVConference
+        /// from tearing the stream (~30 s otherwise). `senderSSRC` = our video send-SSRC.
+        func startRTCPKeepAlive(videoKeyV: Data, senderSSRC: UInt32, logger: VNCLogger) {
+            guard let protector = try? AppleSRTCPProtector(masterBlob: videoKeyV) else {
+                logger.logError("[hp-media] could not build SRTCP protector from video_key_v; no RTCP keep-alive")
+                return
+            }
+            let ctrl = ctrlUDP
+            let timer = DispatchSource.makeTimerSource(queue: rtcpQueue)
+            timer.schedule(deadline: .now() + 0.5, repeating: .milliseconds(500))
+            var tick = 0
+            timer.setEventHandler {
+                tick += 1
+                // Empty RR every tick (peers reject feedback not prefixed by SR/RR).
+                if let rr = try? protector.protect(AppleRTCPBuilders.rrEmpty(sender: senderSSRC)) {
+                    ctrl.send(rr)
+                }
+                // Empty SR every 10th tick (5 s) so AVConference accepts us as a live sender.
+                if tick % 10 == 0 {
+                    let sr = AppleRTCPBuilders.srEmpty(sender: senderSSRC, now: Date().timeIntervalSince1970)
+                    if let p = try? protector.protect(sr) { ctrl.send(p) }
+                }
+                // Legacy-FIR (PT=192) every 2 s to keep the encoder producing.
+                if tick % 4 == 0 {
+                    if let fir = try? protector.protect(
+                        AppleRTCPBuilders.compoundWithRR(sender: senderSSRC,
+                                                         payload: AppleRTCPBuilders.firLegacy(target: senderSSRC))) {
+                        ctrl.send(fir)
+                    }
+                }
+            }
+            rtcpTimer = timer
+            timer.resume()
+            logger.logDebug("[hp-media] RTCP keep-alive started (0.5s RR / 5s SR / 2s legacy-FIR) → ctrl \(ctrl.localPort)")
+        }
+
+        func cancel() {
+            rtcpTimer?.cancel()
+            rtcpTimer = nil
+            videoUDP.cancel()
+            ctrlUDP.cancel()
+        }
     }
 
     /// Bind the video (5901) + ctrl (5900) UDP sockets, wire the video socket to SRTP-decrypt with

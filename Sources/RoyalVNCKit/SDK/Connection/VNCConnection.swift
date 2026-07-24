@@ -122,6 +122,13 @@ public final class VNCConnection: NSObjectOrAnyObject {
 	/// are never logged (NFR-6). `nil` on the standard path / before media negotiation.
 	var appleHPMediaContext: AppleHPMediaContext?
 
+#if canImport(Network)
+	/// The background HP media receiver (UDP video → SRTP decrypt → RTP log + RTCP keep-alive),
+	/// retained for the life of the connection and torn down in `beginDisconnecting` (NFR-5).
+	/// `nil` on the standard path.
+	var appleHPMediaReceiver: MediaReceiver?
+#endif
+
 	lazy var encodings: Encodings = {
 		let rawEncoding = VNCProtocol.RawEncoding()
 		let hextileEncoding = VNCProtocol.HextileEncoding(rawEncoding: rawEncoding)
@@ -354,6 +361,12 @@ extension VNCConnection {
 		connection.setStatusUpdateHandler(nil)
 		connection.cancel()
 
+#if canImport(Network)
+		// Tear down the HP media session (UDP sockets, NAT-prime, RTCP loop) — NFR-5.
+		appleHPMediaReceiver?.cancel()
+		appleHPMediaReceiver = nil
+#endif
+
 		// T1 Change A: the optimistic-CU watchdog must never outlive the connection. The helper is
 		// lock-guarded, so cancelling here (from main / receive / send) is safe.
 		cancelContinuousUpdatesWatchdog()
@@ -429,6 +442,19 @@ private extension VNCConnection {
 		Task {
 			do {
 				try await handshake()
+
+#if canImport(Network)
+				// HP media path: video/audio flow over UDP (SRTP), driven by the background media
+				// session started during the handshake. Do NOT run the standard TCP framebuffer decode
+				// loop — the daemon pushes Apple HP pseudo-encodings (1104 cursor, 0x451 display layout)
+				// the standard decoder can't handle, and the video isn't on TCP anyway. Keep the TCP
+				// control channel open (unread) so the daemon keeps the session + UDP stream alive.
+				if appleHPMediaReceiver != nil {
+					logger.logDebug("[hp-media] media session active (UDP); skipping standard TCP framebuffer loop")
+					updateConnectionState(.connected)
+					return
+				}
+#endif
 
 				// T1 Change A: in optimistic mode, enable Continuous Updates WITHOUT the support guard
 				// and WITHOUT an initial polling request — the enable region solicits the first frame,
