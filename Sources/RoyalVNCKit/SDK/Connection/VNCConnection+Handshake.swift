@@ -477,8 +477,17 @@ private extension VNCConnection {
 		// loop (which can't handle Apple HP pseudo-encodings like 0x451).
 		do {
 			try await connection.write(data: Data(setEncodings))   // SetEncodings 0x02 (crib §2b.1)
-			logger.logDebug("[hp] sent SetEncodings (seal() OK); starting media negotiation")
-			try await performHighPerformanceMediaOffer()
+			// INTERIM: media (0x1c/UDP) and clipboard both ride the TCP control channel but currently
+			// conflict — the media path skips the standard receive loop (can't decode Apple pseudo-
+			// encodings), while clipboard NEEDS that loop for 0x14/0x1f. Until the HP control-channel
+			// reader handles both, pick one: clipboard-enabled → run the control loops (no media offer);
+			// otherwise → Phase-4 media negotiation. Both keep the misalignment fix (peek removed).
+			if settings.isClipboardRedirectionEnabled {
+				logger.logDebug("[hp] clipboard mode — control loops will run (media offer skipped)")
+			} else {
+				logger.logDebug("[hp] sent SetEncodings (seal() OK); starting media negotiation")
+				try await performHighPerformanceMediaOffer()
+			}
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "HP media offer",
 																 underlyingError: error)

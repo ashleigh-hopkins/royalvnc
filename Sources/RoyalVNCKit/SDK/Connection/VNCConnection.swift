@@ -139,7 +139,7 @@ public final class VNCConnection: NSObjectOrAnyObject {
 		let jpegQualityLevelEncodingType = VNCPseudoEncodingType.jpegQualityLevel6.rawValue
 		let jpegQualityLevelEncoding = VNCProtocol.JPEGQualityLevelEncoding(encodingType: jpegQualityLevelEncodingType)
 
-		let encs: Encodings = [
+		var encs: Encodings = [
 			// Frame Encodings
 			VNCFrameEncodingType.copyRect.rawValue: VNCProtocol.CopyRectEncoding(),
             VNCFrameEncodingType.tight.rawValue: VNCProtocol.TightEncoding(),
@@ -160,6 +160,12 @@ public final class VNCConnection: NSObjectOrAnyObject {
 			compressionLevelEncodingType: compressionLevelEncoding,
 			jpegQualityLevelEncodingType: jpegQualityLevelEncoding
 		]
+
+		// HP-gated Apple pseudo-encodings (0x451 display layout, etc.) so the receive loop survives
+		// the control-channel rects the daemon pushes in HP mode. HP-only; standard path unchanged.
+		if settings.enableHighPerformance {
+			encs[1105] = VNCProtocol.AppleDisplayLayoutEncoding()   // 0x451 AppleDisplayLayout
+		}
 
 		// Sanity Check
 		do {
