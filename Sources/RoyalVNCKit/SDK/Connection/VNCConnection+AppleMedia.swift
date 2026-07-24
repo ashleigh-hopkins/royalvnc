@@ -57,6 +57,13 @@ extension VNCConnection {
         let ssrcs = Apple0x1cOffer.harvestSendSSRCs(offer: offer)
         logger.logDebug("[hp-media] built 0x1c offer (\(offer.count) B) videoSSRC=\(ssrcs?.video ?? 0) audioSSRC=\(ssrcs?.audio ?? 0)")
 
+        // Bind the two UDP media sockets + start the NAT-prime loop BEFORE the offer (NFR-8): the
+        // media burst lands ~100 ms after the answer, so the receivers must already be up.
+        #if canImport(Network)
+        let media = try startMediaReceive(videoKeyS: vks)
+        defer { media?.cancel() }
+        #endif
+
         // Send 0x1c offer, then the FramebufferUpdateRequest 0x03 (10 B) that wakes the daemon's
         // pseudo-encoding sender (crib §2b.2-3).
         try await connection.write(data: offer)
@@ -84,6 +91,16 @@ extension VNCConnection {
             fbu09[14] = UInt8(h >> 8); fbu09[15] = UInt8(h & 0xFF)
             try await connection.write(data: Data(fbu09))
             logger.logDebug("[hp-media] sent AutoFrameBufferUpdate 0x09 (\(canvas.width)x\(canvas.height))")
+
+            // Observe the media stream: log decrypted RTP as it arrives (the Phase-4 "done" signal).
+            #if canImport(Network)
+            if let media {
+                for _ in 0..<20 {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                    logger.logDebug("[hp-media] rx: video-datagrams=\(media.stats.videoCount) decrypted-rtp=\(media.stats.decryptedCount) ctrl-datagrams=\(media.stats.ctrlCount)")
+                }
+            }
+            #endif
         }
 
         appleHPMediaContext = AppleHPMediaContext(
@@ -114,3 +131,69 @@ extension VNCConnection {
         UInt64(Date().timeIntervalSince1970 * 1_000_000_000)
     }
 }
+
+#if canImport(Network)
+extension VNCConnection {
+    /// Thread-safe media receive counters (UDP callbacks arrive on the socket queues).
+    final class MediaStats: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _video = 0, _dec = 0, _ctrl = 0
+        var videoCount: Int { lock.lock(); defer { lock.unlock() }; return _video }
+        var decryptedCount: Int { lock.lock(); defer { lock.unlock() }; return _dec }
+        var ctrlCount: Int { lock.lock(); defer { lock.unlock() }; return _ctrl }
+        func addVideo() { lock.lock(); _video += 1; lock.unlock() }
+        func addDecrypted() { lock.lock(); _dec += 1; lock.unlock() }
+        func addCtrl() { lock.lock(); _ctrl += 1; lock.unlock() }
+    }
+
+    /// Owns the two UDP media sockets for the receive window.
+    final class MediaReceiver {
+        let stats = MediaStats()
+        let videoUDP: AppleUDPDatagramConnection
+        let ctrlUDP: AppleUDPDatagramConnection
+        init(videoUDP: AppleUDPDatagramConnection, ctrlUDP: AppleUDPDatagramConnection) {
+            self.videoUDP = videoUDP
+            self.ctrlUDP = ctrlUDP
+        }
+        func cancel() { videoUDP.cancel(); ctrlUDP.cancel() }
+    }
+
+    /// Bind the video (5901) + ctrl (5900) UDP sockets, wire the video socket to SRTP-decrypt with
+    /// `vks` and log decrypted RTP, and start the NAT-prime loop (crib §4a-§4e). Returns the receiver
+    /// (kept alive for the observation window). Never logs key material (NFR-6); a ≤16-byte payload
+    /// prefix is allowed (D5).
+    func startMediaReceive(videoKeyS: Data) throws -> MediaReceiver? {
+        let host = settings.hostname
+        let ctrlPort = settings.port
+        let videoPort = settings.port &+ 1
+
+        let videoUDP = AppleUDPDatagramConnection(host: host, remotePort: videoPort, localPort: videoPort, label: "video")
+        let ctrlUDP = AppleUDPDatagramConnection(host: host, remotePort: ctrlPort, localPort: ctrlPort, label: "ctrl")
+        let receiver = MediaReceiver(videoUDP: videoUDP, ctrlUDP: ctrlUDP)
+        let stats = receiver.stats
+        let logger = self.logger
+
+        let decryptor = try? AppleSRTPDecryptor(masterBlob: videoKeyS)
+        if decryptor == nil { logger.logError("[hp-media] could not build SRTP decryptor from vks") }
+
+        videoUDP.start(onDatagram: { data in
+            stats.addVideo()
+            guard let dec = decryptor, let (header, payload) = dec.decrypt(packet: data) else { return }
+            stats.addDecrypted()
+            let prefix = payload.prefix(16).map { String(format: "%02x", $0) }.joined()
+            logger.logDebug("[hp-rtp] PT=\(header.payloadType) ssrc=\(header.ssrc) seq=\(header.sequenceNumber) ts=\(header.timestamp) marker=\(header.marker) len=\(payload.count) h[\(prefix)]")
+        }, onState: { state in
+            logger.logDebug("[hp-media] video UDP(\(videoPort)) state: \(String(describing: state))")
+        })
+
+        ctrlUDP.start(onDatagram: { _ in stats.addCtrl() }, onState: { state in
+            logger.logDebug("[hp-media] ctrl UDP(\(ctrlPort)) state: \(String(describing: state))")
+        })
+
+        videoUDP.startNATPrime()
+        ctrlUDP.startNATPrime()
+        logger.logDebug("[hp-media] UDP bound video=\(videoPort) ctrl=\(ctrlPort) → host \(host); NAT-prime started")
+        return receiver
+    }
+}
+#endif
