@@ -66,11 +66,19 @@ final class AppleRSA1EnvelopeTests: XCTestCase {
         XCTAssertEqual(envelope.count, 1076, "c2s2 is framed to 1076 bytes")
         let bytes = Array(envelope)
 
-        // u16 A_len
-        XCTAssertEqual(Array(bytes[0..<2]), [0x02, 0x00], "A_len = 512 big-endian")
-        XCTAssertEqual(Data(bytes[2..<514]), a, "A at offset 2")
+        // Outer RSA1 header (14 bytes): version (little-endian) + 'RSA1' + authtype + outer_len + inner_len.
+        XCTAssertEqual(Array(bytes[0..<2]), [0x01, 0x00], "version = 1 (little-endian u16)")
+        XCTAssertEqual(Array(bytes[2..<6]), [0x52, 0x53, 0x41, 0x31], "'RSA1'")
+        XCTAssertEqual(Array(bytes[6..<8]), [0x00, 0x02], "authtype = 2")
+        let sdLen = 598 + opts.count   // A_len(2)+A(512)+M1_len(1)+M1(64)+cap_len(2)+cap+cr_len(1)+cr(16)
+        XCTAssertEqual(Int(bytes[8]) << 8 | Int(bytes[9]), sdLen + 4, "outer_len = len(sd)+4 (big-endian)")
+        let innerLen = (Int(bytes[10]) << 24) | (Int(bytes[11]) << 16) | (Int(bytes[12]) << 8) | Int(bytes[13])
+        XCTAssertEqual(innerLen, sdLen, "inner_len = len(sd) (big-endian)")
 
-        var offset = 514
+        // Inner proof block `sd` begins at offset 14.
+        var offset = 14
+        XCTAssertEqual(Int(bytes[offset]) << 8 | Int(bytes[offset + 1]), 512, "A_len = 512 big-endian"); offset += 2
+        XCTAssertEqual(Data(bytes[offset..<(offset + 512)]), a, "A"); offset += 512
         XCTAssertEqual(bytes[offset], 0x40, "u8 64 marker before M1"); offset += 1
         XCTAssertEqual(Data(bytes[offset..<(offset + 64)]), m1, "M1[64]"); offset += 64
 

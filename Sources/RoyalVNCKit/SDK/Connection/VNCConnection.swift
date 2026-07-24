@@ -325,7 +325,19 @@ extension VNCConnection {
 	func beginConnecting() {
 		updateConnectionState(.connecting)
 
-		connection.start(queue: queue)
+		if settings.enableHighPerformance {
+			// HP-SPECS §14: run Apple's two-TCP warmup BEFORE the real session TCP. Dispatched on the
+			// connection queue so the ~1.4s dwell never blocks the caller (UI) thread; the connection
+			// isn't started until the warmup returns.
+			queue.async { [weak self] in
+				guard let self else { return }
+
+				self.performAppleTwoTCPWarmup()
+				self.connection.start(queue: self.queue)
+			}
+		} else {
+			connection.start(queue: queue)
+		}
 	}
 
 	func beginDisconnecting(error: Error? = nil) {

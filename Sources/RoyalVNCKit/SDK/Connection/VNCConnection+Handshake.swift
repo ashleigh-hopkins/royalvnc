@@ -139,12 +139,19 @@ private extension VNCConnection {
 	}
 
 	func sendAuthenticationData(securityType: VNCProtocol.SecurityType) async throws {
-		do {
-			try await VNCProtocol.SecurityTypes.send(connection: connection,
-													 securityType: securityType.rawValue)
-		} catch {
-			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Authentication Data",
-																 underlyingError: error)
+		// HP (apple33): Apple screensharingd expects the 0x21 auth-type selector and the RSA1 init to
+		// arrive as ONE atomic blob (the reference sends `21 00 00 00 0a 01 00 'RSA1' …` in a single
+		// write). Sending 0x21 as a separate write here — as the standard path does — makes the daemon
+		// tear the TCP right after the RSA1 init. So for apple33 the coordinator emits the combined
+		// selector+init blob; we skip the standalone selector send.
+		if !(settings.enableHighPerformance && securityType == .apple33) {
+			do {
+				try await VNCProtocol.SecurityTypes.send(connection: connection,
+														 securityType: securityType.rawValue)
+			} catch {
+				throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Authentication Data",
+																	 underlyingError: error)
+			}
 		}
 
 		logger.logDebug("Sent Security Type: \(securityType)")
@@ -277,8 +284,13 @@ private extension VNCConnection {
 		let serverInit: VNCProtocol.ServerInit
 
 		do {
-			serverInit = try await VNCProtocol.ServerInit.receive(connection: connection,
-																  isTightSecurityEnabled: state.isTightSecurityEnabled)
+			if settings.enableHighPerformance {
+				// HP: Apple's ServerInit name may not be valid UTF-8 — read leniently, discard the name.
+				serverInit = try await receiveAppleServerInit()
+			} else {
+				serverInit = try await VNCProtocol.ServerInit.receive(connection: connection,
+																	  isTightSecurityEnabled: state.isTightSecurityEnabled)
+			}
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Receive Server Init",
 																 underlyingError: error)
@@ -375,80 +387,150 @@ private extension VNCConnection {
 		// Held transiently until arming; never logged (NFR-6).
 		appleHPWrapKey = success.wrapKey
 
-		logger.logDebug("Apple RSA-SRP authentication succeeded (M2 verified, SecurityResult == 0)")
+		logger.logDebug("Apple RSA-SRP authentication succeeded (SecurityResult == 0)")
 	}
 
-	/// The HP control bring-up after `ServerInit` (HP-SPECS §4.3 steps 5-6): send the cleartext prelude,
-	/// read the `0x44f` rekey, unwrap it, and arm the AES-128-CBC record layer on the connection.
+	/// The HP control bring-up after `ServerInit` (HP-SPECS §4.3 steps 5-7 + §14 live corrections):
+	/// plaintext prelude → receive the `1103` rekey as a rect inside a plaintext `FramebufferUpdate`
+	/// (0x00) → unwrap → send the plaintext `PostEncryptionToggle` → arm the AES-128-CBC record layer →
+	/// exercise one encrypted round-trip (proves `seal()`/`open()` live). Byte layouts are the
+	/// live-confirmed values from `agents/TEMP/hp-phase3/post-auth-crib.md`.
 	///
-	/// WIRE LAYOUT — ORACLE-GATED (O6.5 prelude, O7 rekey). The prelude message bodies and the `0x44f`
-	/// framing are implemented to the dossier's stated layout and confirmed byte-for-byte at the live
-	/// checkpoint; they are NOT offline-verifiable. In particular the `ViewerInfo` payload (dossier
-	/// names only the `0x21` type) and R6 (the rekey may arrive between `SetEncryption` cmd=1 and cmd=2)
-	/// are pinned live. `SetEncryption` cmd=1/cmd=2 use the concrete dossier §3.1 hex.
+	/// NOTE (AC-2): a still-bitmap framebuffer is NOT obtainable here — Apple HP delivers every pixel
+	/// over UDP/SRTP HEVC armed by the encrypted `0x1c` media offer (Phase 4). The TCP record layer only
+	/// carries control + pseudo-encodings. This bring-up therefore proves the control channel end-to-end
+	/// (record layer armed + encrypted round-trip), which is the achievable Phase-3 milestone.
 	func performHighPerformanceControlBringUp() async throws {
 		guard let wrapKey = appleHPWrapKey else {
 			// Arm requires the wrap key from a completed RSA-SRP auth.
 			throw VNCError.authentication(.ardAuthenticationFailed)
 		}
 
+		// § crib 2 — plaintext prelude (client sends only; reads nothing until the rekey burst).
+		// ViewerInfo (0x21, 66B) + Apple 0x12 follow-up (12B) in ONE write.
+		let viewerInfoPlus12: [UInt8] = [
+			0x21,0x00,0x00,0x3e,0x00,0x01,0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x06,0x00,0x00,
+			0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0f,0x00,0x00,0x00,0x03,0x00,0x00,
+			0x00,0x00,0xb0,0x00,0x0c,0x03,0x90,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,
+			0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+			0x00,0x00,
+			0x12,0x00,0x00,0x01,0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x01
+		]
+		// SetEncodings (0x02, 56B): count=13, HP_ENCODINGS_FULL. Skip SetDisplayConfiguration 0x1d
+		// (that is curtain-only; we do not curtain).
+		let setEncodings: [UInt8] = [
+			0x02,0x00,0x00,0x0d,
+			0x00,0x00,0x03,0xf2, 0x00,0x00,0x03,0xf3, 0x00,0x00,0x03,0xea,
+			0x00,0x00,0x00,0x06, 0x00,0x00,0x00,0x10, 0x00,0x00,0x04,0x50,
+			0x00,0x00,0x04,0x4c, 0xff,0xff,0xff,0x21, 0x00,0x00,0x04,0x4d,
+			0x00,0x00,0x04,0x51, 0x00,0x00,0x04,0x53, 0x00,0x00,0x04,0x55,
+			0x00,0x00,0x04,0x56
+		]
 		do {
-			// ViewerInfo (0x21) — ORACLE(O6.5): payload beyond the type byte is pinned at the live
-			// checkpoint (the dossier names only the message type).
-			try await connection.write(data: Data([0x21]))
-
-			// SetEncryption cmd=1: 12 00 0001 0001 0001 00000001 (dossier §3.1 step 5).
-			try await connection.write(data: Data([0x12, 0x00,
-													0x00, 0x01,
-													0x00, 0x01,
-													0x00, 0x01,
-													0x00, 0x00, 0x00, 0x01]))
-
-			// SetEncryption cmd=2: 12 00 0002 0001 0000 (dossier §3.1 step 5).
-			try await connection.write(data: Data([0x12, 0x00,
-													0x00, 0x02,
-													0x00, 0x01,
-													0x00, 0x00]))
+			try await connection.write(data: Data(viewerInfoPlus12))
+			try await Task.sleep(nanoseconds: 100_000_000)   // _POST_VIEWERINFO_SETTLE_S = 0.1s
+			try await connection.write(data: Data(setEncodings))
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send HP Prelude",
 																 underlyingError: error)
 		}
+		logger.logDebug("[hp] sent plaintext prelude (ViewerInfo+0x12, SetEncodings)")
 
-		// Read the 0x44f rekey. ORACLE(O7): assumes a u16 message-type (0x044f) followed by the 36-byte
-		// body; R6 (arrival between cmd=1 and cmd=2) is pinned live.
+		// § crib 3 — the 36-byte 1103 rekey arrives as a rect inside a plaintext FramebufferUpdate (0x00).
 		let rekeyBody: Data
 		do {
-			let messageType = try await connection.readUInt16()
-			guard messageType == 0x044f else {
-				throw VNCError.protocol(.invalidData)
-			}
-			rekeyBody = try await connection.readBuffered(length: AppleRecordKeySchedule.rekeyLength)
+			rekeyBody = try await readAppleRekeyBlob()
 		} catch {
-			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Read 0x44f Rekey",
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Read 1103 Rekey",
 																 underlyingError: error)
 		}
 
-		try armAppleRecordLayer(wrapKey: wrapKey, rekeyBody: rekeyBody)
-	}
-
-	/// Unwrap the `0x44f` rekey body under `wrapKey` and flip the connection's record layer into CBC
-	/// mode (HP-SPECS §5.3). The recovered key/iv become the CBC content key/iv for both directions.
-	/// Clears the retained wrap key afterwards (NFR-6).
-	func armAppleRecordLayer(wrapKey: Data, rekeyBody: Data) throws {
-		guard let recordLayer = connection as? AppleRecordLayerConnection else {
-			// The decorator is always present when HP is on; its absence is a wiring error.
-			throw VNCError.authentication(.ardAuthenticationFailed)
-		}
-
+		// Unwrap → CBC content key + iv (do NOT activate yet — the toggle must go out plaintext first).
 		let parsed = try AppleRecordKeySchedule.parseRekey(rekeyBody)
 		let recovered = try AppleRecordKeySchedule.unwrap((keyWrapped: parsed.keyWrapped,
 														   ivWrapped: parsed.ivWrapped),
 														  wrapKey: wrapKey)
+		guard let recordLayer = connection as? AppleRecordLayerConnection else {
+			throw VNCError.authentication(.ardAuthenticationFailed)   // decorator must be present under HP
+		}
 
+		// § crib 3 — PostEncryptionToggle (0x12, 8B) is the LAST plaintext byte the client sends. It goes
+		// out BEFORE arming so the record layer is still in passthrough (plaintext) for this write.
+		do {
+			try await connection.write(data: Data([0x12,0x00,0x00,0x02,0x00,0x01,0x00,0x00]))
+		} catch {
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send PostEncryptionToggle",
+																 underlyingError: error)
+		}
+
+		// Arm: both directions flip to encrypted (server already flipped right after the 1103 rect).
 		try recordLayer.activateRecordLayer(contentKey: recovered.key, iv: recovered.iv)
-
 		appleHPWrapKey = nil
+		logger.logDebug("[hp] AES-128-CBC record layer ARMED (generation \(parsed.gen))")
+		try await Task.sleep(nanoseconds: 200_000_000)   // _POST_TOGGLE_SETTLE_S = 0.2s
 
-		logger.logDebug("Apple AES-128-CBC record layer armed (generation \(parsed.gen))")
+		// Exercise the record layer live — proves seal() (encrypt) and open() (decrypt + SHA-1 verify).
+		// These writes now auto-seal (record layer active). A malformed record → server closes; a valid
+		// one → the daemon answers our FBU request with an encrypted FramebufferUpdate we then open().
+		do {
+			try await connection.write(data: Data(setEncodings))                                  // seal seq 0
+			try await connection.write(data: Data([0x03,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff])) // seal seq 1 (FBU req)
+			logger.logDebug("[hp] sent 2 encrypted records (SetEncodings, FBU request) — seal() OK")
+			let firstByte = try await connection.readUInt8()   // funnels through open() (decrypt+verify)
+			logger.logDebug("[hp] ENCRYPTED ROUND-TRIP OK — decrypted server msg type 0x\(String(firstByte, radix: 16)) (open() verified)")
+		} catch {
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "HP encrypted round-trip",
+																 underlyingError: error)
+		}
+	}
+
+	/// Read the 36-byte `1103` rekey blob, which Apple delivers as a rect inside a plaintext
+	/// `FramebufferUpdate` (msg 0x00) — NOT a bespoke message (§ crib 3). Skips an optional leading
+	/// `0x14` UserSessionChanged (8B), then walks rects: `1103` → the next fixed 36 bytes are the blob;
+	/// config siblings `1010`/`1011` carry a `u16` length prefix (skip `2+size`); any other encoding stops.
+	func readAppleRekeyBlob() async throws -> Data {
+		var msgType = try await connection.readUInt8()
+		while msgType == 0x14 {                       // optional UserSessionChanged notification (8B)
+			_ = try await connection.readBuffered(length: 7)
+			msgType = try await connection.readUInt8()
+		}
+		guard msgType == 0x00 else {                  // FramebufferUpdate
+			throw VNCError.protocol(.invalidData)
+		}
+		_ = try await connection.readUInt8()          // 1 pad byte
+		let numRects = try await connection.readUInt16()
+
+		for _ in 0..<numRects {
+			_ = try await connection.readBuffered(length: 8)   // rect x,y,w,h (4× u16)
+			let encoding = try await connection.readUInt32()   // s32 BE encoding (all positive here)
+			if encoding == 1103 {
+				return try await connection.readBuffered(length: AppleRecordKeySchedule.rekeyLength)
+			} else if encoding == 1010 || encoding == 1011 {
+				let size = try await connection.readUInt16()
+				_ = try await connection.readBuffered(length: Int(size))
+			} else {
+				break                                          // unknown encoding → stop
+			}
+		}
+		throw VNCError.protocol(.invalidData)                  // no 1103 rect found
+	}
+
+	/// HP ServerInit read (§ crib 1): Apple 003.889 ServerInit is byte-for-byte standard RFC 6143, but
+	/// the desktop-name bytes are NOT guaranteed valid UTF-8 and must be DISCARDED, not validated — the
+	/// standard `readString(encoding:.utf8)` throws `.invalidData` on the name. Reads the fixed 24-byte
+	/// header (u16 width, u16 height, 16-byte PixelFormat) then `u32` name-length + that many bytes,
+	/// decoding the name losslessly (never throws).
+	func receiveAppleServerInit() async throws -> VNCProtocol.ServerInit {
+		let width = try await connection.readUInt16()
+		let height = try await connection.readUInt16()
+		let pixelFormat = try await VNCProtocol.PixelFormat.receive(connection: connection)
+		let nameLength = try await connection.readUInt32()
+		logger.logDebug("[hp] ServerInit: \(width)x\(height) nameLen=\(nameLength)")
+		var name = ""
+		if nameLength > 0, nameLength <= 4096 {
+			let nameData = try await connection.readBuffered(length: Int(nameLength))
+			name = String(decoding: nameData, as: UTF8.self)   // lossy — never throws
+		}
+		return .init(framebufferWidth: width, framebufferHeight: height, pixelFormat: pixelFormat, name: name)
 	}
 }

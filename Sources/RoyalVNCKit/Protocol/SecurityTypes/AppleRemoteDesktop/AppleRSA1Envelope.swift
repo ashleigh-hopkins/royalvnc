@@ -143,12 +143,19 @@ enum AppleRSA1Envelope {
         return data
     }
 
-    /// The step-3 envelope (HP-SPECS §5.2 step 3), zero-padded ("framed") to 1076 bytes:
-    /// `u16 A_len || A || u8 64 || M1[64] || u16 opts_len || opts || u8 16 || client_random[16]`.
+    /// The step-3 envelope (HP-SPECS §5.2 step 3), zero-padded ("framed") to 1076 bytes.
     ///
-    /// The exact 1076-byte composition (A wire-width, pad placement) is oracle-gated at O5
-    /// (HP-SPECS §8): this takes the literal dossier field list and zero-pads the remainder, with
-    /// `A` written at its supplied length (`AppleSRPClient` supplies the 512-byte PAD-ed `A`).
+    /// O5-CONFIRMED wire layout (reference `auth.py:308-326`): an inner proof block `sd` wrapped in
+    /// an outer RSA1 header (the same shape as `c2s1` but with an extra u32 inner-length). `sd` is
+    /// sent in the clear (NOT RSA-encrypted — only `c2s1`'s identity slot is RSA-wrapped):
+    ///
+    ///   sd    = u16-BE A_len || A || u8 M1_len(64) || M1[64]
+    ///           || u16-BE cap_len || cap || u8 client_random_len(16) || client_random[16]
+    ///   frame = 01 00 || 'RSA1' 00 02 || u16-BE (len(sd)+4) || u32-BE len(sd) || sd
+    ///           || zero pad to 1076
+    ///
+    /// Note the mixed endianness within the header: `version` is little-endian u16 (`01 00`) while
+    /// every length field is big-endian. `M1_len` and `client_random_len` are single u8 bytes.
     static func c2s2(A: Data, M1: Data, opts: Data, clientRandom: Data) throws -> Data {
         guard M1.count == 64, clientRandom.count == 16 else {
             throw VNCError.protocol(.invalidData)
@@ -157,15 +164,25 @@ enum AppleRSA1Envelope {
             throw VNCError.protocol(.invalidData)
         }
 
+        // Inner proof block `sd`.
+        var sd = Data()
+        sd.append(bigEndian16(UInt16(A.count)))                 // u16-BE A_len
+        sd.append(A)
+        sd.append(0x40)                                         // u8 M1_len = 64
+        sd.append(M1)                                           // 64 bytes
+        sd.append(bigEndian16(UInt16(opts.count)))              // u16-BE cap_len
+        sd.append(opts)
+        sd.append(0x10)                                         // u8 client_random_len = 16
+        sd.append(clientRandom)                                 // 16 bytes
+
+        // Outer RSA1 header (version little-endian; lengths big-endian).
         var data = Data()
-        data.append(bigEndian16(UInt16(A.count)))               // A_len
-        data.append(A)
-        data.append(0x40)                                       // u8 64
-        data.append(M1)                                         // 64 bytes
-        data.append(bigEndian16(UInt16(opts.count)))            // opts_len
-        data.append(opts)
-        data.append(0x10)                                       // u8 16
-        data.append(clientRandom)                               // 16 bytes
+        data.append(contentsOf: [0x01, 0x00])                   // version = 1 (LE u16)
+        data.append(contentsOf: [0x52, 0x53, 0x41, 0x31])       // 'RSA1'
+        data.append(bigEndian16(0x0002))                        // authtype = 2  → magic "RSA1\0\2"
+        data.append(bigEndian16(UInt16(sd.count + 4)))          // outer_len = len(sd)+4 (BE)
+        data.append(bigEndian32(UInt32(sd.count)))              // inner_len = len(sd)    (BE)
+        data.append(sd)
 
         guard data.count <= 1076 else {
             throw VNCError.protocol(.invalidData)
