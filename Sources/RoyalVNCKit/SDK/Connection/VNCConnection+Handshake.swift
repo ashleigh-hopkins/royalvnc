@@ -469,17 +469,18 @@ private extension VNCConnection {
 		logger.logDebug("[hp] AES-128-CBC record layer ARMED (generation \(parsed.gen))")
 		try await Task.sleep(nanoseconds: 200_000_000)   // _POST_TOGGLE_SETTLE_S = 0.2s
 
-		// Exercise the record layer live — proves seal() (encrypt) and open() (decrypt + SHA-1 verify).
-		// These writes now auto-seal (record layer active). A malformed record → server closes; a valid
-		// one → the daemon answers our FBU request with an encrypted FramebufferUpdate we then open().
+		// Phase-4 media negotiation over the armed record layer (crib §2b): SetEncodings 0x02 →
+		// 0x1c offer → FBU-req 0x03 → read the answer canvas → 0x09. This REPLACES the old 1-byte
+		// readUInt8() "round-trip proof", which left the rest of the first FramebufferUpdate buffered
+		// and misaligned the standard receive loop by one byte (HP-FBU-MISALIGN-REPORT). The media
+		// path drives its own reads via open() and does NOT fall into the standard framebuffer decode
+		// loop (which can't handle Apple HP pseudo-encodings like 0x451).
 		do {
-			try await connection.write(data: Data(setEncodings))                                  // seal seq 0
-			try await connection.write(data: Data([0x03,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff])) // seal seq 1 (FBU req)
-			logger.logDebug("[hp] sent 2 encrypted records (SetEncodings, FBU request) — seal() OK")
-			let firstByte = try await connection.readUInt8()   // funnels through open() (decrypt+verify)
-			logger.logDebug("[hp] ENCRYPTED ROUND-TRIP OK — decrypted server msg type 0x\(String(firstByte, radix: 16)) (open() verified)")
+			try await connection.write(data: Data(setEncodings))   // SetEncodings 0x02 (crib §2b.1)
+			logger.logDebug("[hp] sent SetEncodings (seal() OK); starting media negotiation")
+			try await performHighPerformanceMediaOffer()
 		} catch {
-			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "HP encrypted round-trip",
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "HP media offer",
 																 underlyingError: error)
 		}
 	}

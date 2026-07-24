@@ -117,6 +117,11 @@ public final class VNCConnection: NSObjectOrAnyObject {
 	/// Cleared immediately after arming (NFR-6). `nil` on the standard path.
 	var appleHPWrapKey: Data?
 
+	/// Per-session HP media negotiation state (SRTP master blobs + send-SSRCs + negotiated canvas),
+	/// set by `performHighPerformanceMediaOffer` and retained for the SRTP/UDP receive step. Blobs
+	/// are never logged (NFR-6). `nil` on the standard path / before media negotiation.
+	var appleHPMediaContext: AppleHPMediaContext?
+
 	lazy var encodings: Encodings = {
 		let rawEncoding = VNCProtocol.RawEncoding()
 		let hextileEncoding = VNCProtocol.HextileEncoding(rawEncoding: rawEncoding)
