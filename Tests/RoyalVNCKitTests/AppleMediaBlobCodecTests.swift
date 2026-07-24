@@ -117,6 +117,12 @@ final class AppleMediaBlobCodecTests: XCTestCase {
         XCTAssertNil(AppleMediaBlobCodec.readVarint([], 0))
     }
 
+    /// RemoteEndpointInfo protobuf: f1=0, f2=1, f3=hwModel, f4=avcVersion, f5=osBuild (hand-computed).
+    func testRemoteEndpointInfo() {
+        let rei = AppleMediaBlobCodec.buildRemoteEndpointInfo(hwModel: "Generic", avcVersion: "1.0.0", osBuild: "0")
+        XCTAssertEqual(rei, hex("080010011a0747656e657269632205312e302e302a0130"))
+    }
+
     func testFieldEncoders() {
         // field 16, varint 0 → tag 128 (0x80 0x01) ‖ 0x00.
         XCTAssertEqual(AppleMediaBlobCodec.fieldVarint(16, 0), [0x80, 0x01, 0x00])

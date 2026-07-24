@@ -173,6 +173,21 @@ enum AppleMediaBlobCodec {
         return out
     }()
 
+    // MARK: - RemoteEndpointInfo (crib §1c)
+
+    /// Build the `avcMediaStreamOptionRemoteEndpointInfo` protobuf (offers.py `_build_remote_endpoint_info`):
+    /// `f1=0, f2=1, f3=hwModel, f4=avcVersion, f5=osBuild`. AVConference treats this as informational
+    /// (it does NOT validate it), so the values are injectable — pass real device values at the
+    /// integration layer, fixed values in tests. Each string is UTF-8, truncated to 127 bytes.
+    static func buildRemoteEndpointInfo(hwModel: String, avcVersion: String, osBuild: String) -> Data {
+        func str127(_ s: String) -> [UInt8] { Array(s.utf8.prefix(127)) }
+        var out = fieldVarint(1, 0) + fieldVarint(2, 1)
+        out += fieldBytes(3, str127(hwModel))
+        out += fieldBytes(4, str127(avcVersion))
+        out += fieldBytes(5, str127(osBuild))
+        return Data(out)
+    }
+
     // MARK: - Send-SSRC harvest (crib §1c)
 
     /// Extract our advertised send-SSRC from an (uncompressed) MediaBlob: video = field 5 → sub 1,
