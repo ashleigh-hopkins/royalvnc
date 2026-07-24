@@ -57,6 +57,15 @@ public final class VNCConnection: NSObjectOrAnyObject {
 	var receiveTask: Task<(), Error>?
 	var sendTask: Task<(), Error>?
 
+	/// HP-only: the Apple control-channel receive loop task (record-framed; replaces the standard
+	/// framebuffer receive loop on the HP path). `nil` on the standard path. Exits on the shared
+	/// `state.disconnectRequested` flag like `receiveTask`/`sendTask`.
+	var appleControlTask: Task<(), Error>?
+
+	/// HP-only: in-progress reassembly buffer for a multi-record `0x1f` clipboard send (crib §7a).
+	/// `nil` when no `0x1f` is mid-reassembly. Touched only by the single control-loop task.
+	var appleClipboardReassembly: Data?
+
 	// T1: guards the fields that Change A/B make genuinely cross-task (the receive loop, the send loop,
 	// the main-thread quality API, and the one-shot watchdog task all touch them). This is the SOLE
 	// access path for `state.areContinuousUpdatesEnabled`, `state.optimisticCUActive`,
@@ -127,6 +136,12 @@ public final class VNCConnection: NSObjectOrAnyObject {
 	/// retained for the life of the connection and torn down in `beginDisconnecting` (NFR-5).
 	/// `nil` on the standard path.
 	var appleHPMediaReceiver: MediaReceiver?
+
+	/// Whether a background HP media session is active (platform-safe accessor for logging/wiring).
+	var appleHPMediaReceiverActive: Bool { appleHPMediaReceiver != nil }
+#else
+	/// No media receiver on non-Network platforms (control-channel HP still runs).
+	var appleHPMediaReceiverActive: Bool { false }
 #endif
 
 	lazy var encodings: Encodings = {
@@ -161,11 +176,10 @@ public final class VNCConnection: NSObjectOrAnyObject {
 			jpegQualityLevelEncodingType: jpegQualityLevelEncoding
 		]
 
-		// HP-gated Apple pseudo-encodings (0x451 display layout, etc.) so the receive loop survives
-		// the control-channel rects the daemon pushes in HP mode. HP-only; standard path unchanged.
-		if settings.enableHighPerformance {
-			encs[1105] = VNCProtocol.AppleDisplayLayoutEncoding()   // 0x451 AppleDisplayLayout
-		}
+		// NOTE (HP): Apple's control-channel pseudo-encodings (cursor 1104, display-layout 0x451, config
+		// blobs) are NOT registered here — the HP path does not run the standard framebuffer decoder.
+		// They are parsed in-memory, record-framed, by `VNCConnection+AppleControl` (crib §7), which is
+		// the only way to survive unknown-length Apple encodings without desyncing.
 
 		// Sanity Check
 		do {
@@ -449,18 +463,19 @@ private extension VNCConnection {
 			do {
 				try await handshake()
 
-#if canImport(Network)
-				// HP media path: video/audio flow over UDP (SRTP), driven by the background media
-				// session started during the handshake. Do NOT run the standard TCP framebuffer decode
-				// loop — the daemon pushes Apple HP pseudo-encodings (1104 cursor, 0x451 display layout)
-				// the standard decoder can't handle, and the video isn't on TCP anyway. Keep the TCP
-				// control channel open (unread) so the daemon keeps the session + UDP stream alive.
-				if appleHPMediaReceiver != nil {
-					logger.logDebug("[hp-media] media session active (UDP); skipping standard TCP framebuffer loop")
+				// HP path: on TCP the daemon speaks only Apple control (cursor 1104 / layout 0x451 / config
+				// blobs inside 0x00 FBUs, plus clipboard 0x14/0x1f) — real pixels flow over UDP/SRTP. Run
+				// the record-framed Apple control loop instead of the standard framebuffer decode loop (which
+				// can't survive Apple pseudo-encodings), plus the send loop for clipboard bring-up + outbound.
+				// The background media receiver (if negotiated during the handshake) streams UDP in parallel,
+				// so ONE HP session carries media (UDP) AND control/clipboard (TCP) together.
+				if settings.enableHighPerformance {
+					logger.logDebug("[hp] connected — starting Apple control loop + send loop (media receiver active: \(appleHPMediaReceiverActive))")
 					updateConnectionState(.connected)
+					startAppleControlLoop()
+					startSendLoop()
 					return
 				}
-#endif
 
 				// T1 Change A: in optimistic mode, enable Continuous Updates WITHOUT the support guard
 				// and WITHOUT an initial polling request — the enable region solicits the first frame,

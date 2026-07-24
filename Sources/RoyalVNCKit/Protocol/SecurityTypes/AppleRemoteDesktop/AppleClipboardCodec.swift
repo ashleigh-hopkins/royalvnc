@@ -131,6 +131,21 @@ enum AppleClipboardCodec {
         let compressedSize: UInt32
     }
 
+    /// Reassembly: given an accumulating `0x1f` buffer (a `0x1f` first record plus zero or more
+    /// continuation records, which carry no type byte — crib §7a), return the complete message
+    /// (`16 + compressedSize` bytes) once enough records have arrived, or `nil` if more are needed
+    /// (buffer shorter than the header, or shorter than the declared total). Throws on a full-length
+    /// header that isn't a valid `0x1f`.
+    static func completeClipboardSend(_ accumulated: Data) throws -> Data? {
+        guard accumulated.count >= headerLength else { return nil }
+        guard let header = parseSendHeader(accumulated) else {
+            throw VNCError.protocol(.invalidData)
+        }
+        let total = headerLength + Int(header.compressedSize)
+        guard accumulated.count >= total else { return nil }
+        return Data(accumulated.prefix(total))
+    }
+
     /// Parse the 16-byte `0x1f` header, or `nil` if too short / not a `0x1f`.
     static func parseSendHeader(_ data: Data) -> SendHeader? {
         let b = [UInt8](data)

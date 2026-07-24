@@ -71,58 +71,8 @@ extension VNCConnection {
     }
 }
 
-// MARK: - Receive side (dispatched from VNCConnection+Receive.swift)
-extension VNCConnection {
-    /// `0x14` MiscStatus (8 bytes; type already consumed). On `cmd=2` (remote clipboard changed) reply
-    /// with a `0x0b` fetch; other commands (incl. the macOS-27 `cmd=4` heartbeat) are ignored.
-    func handleAppleMiscStatusMessage() async throws {
-        guard settings.enableHighPerformance else {
-            throw VNCError.protocol(.unsupportedServerToClientMessage(messageType: AppleClipboardCodec.msgMiscStatus))
-        }
-
-        let rest = try await connection.readBuffered(length: 7)
-        var body = Data([AppleClipboardCodec.msgMiscStatus])
-        body.append(rest)
-
-        if AppleClipboardCodec.isRemoteClipboardChanged(body) {
-            guard settings.isClipboardRedirectionEnabled else { return }
-            logger.logDebug("Apple clipboard: remote changed (0x14 cmd=2), fetching")
-            enqueueAppleClipboardFetch()
-        }
-    }
-
-    /// `0x1f` ClipboardSend (16-byte header + `Z_SYNC_FLUSH` zlib archive; type already consumed).
-    /// Reads the whole message (the transparent record layer spans cipher frames), decodes the text
-    /// flavor and hands it to the delegate via the existing server-cut-text path.
-    func handleAppleClipboardSendMessage() async throws {
-        guard settings.enableHighPerformance else {
-            throw VNCError.protocol(.unsupportedServerToClientMessage(messageType: AppleClipboardCodec.msgClipboardSend))
-        }
-
-        // Rebuild the 16-byte header (type byte + the remaining 15) to parse sizes.
-        let headerRest = try await connection.readBuffered(length: AppleClipboardCodec.headerLength - 1)
-        var header = Data([AppleClipboardCodec.msgClipboardSend])
-        header.append(headerRest)
-
-        guard let parsed = AppleClipboardCodec.parseSendHeader(header) else {
-            throw VNCError.protocol(.invalidData)
-        }
-
-        // Always drain the compressed payload to keep the record stream aligned, even if we won't use it.
-        let payload = parsed.compressedSize > 0
-            ? try await connection.readBuffered(length: Int(parsed.compressedSize))
-            : Data()
-
-        guard settings.isClipboardRedirectionEnabled else { return }
-
-        var full = header
-        full.append(payload)
-
-        if let text = try AppleClipboardCodec.decodeInboundText(full), !text.isEmpty {
-            logger.logDebug("Apple clipboard: received \(text.count) chars from host")
-            // Same delivery path as standard ServerCutText: the app delegate is the sole pasteboard
-            // writer (async on main, with echo-dedup) — T1 Change D.
-            notifyDelegateAboutServerCutText(text)
-        }
-    }
-}
+// NOTE: The inbound `0x14`/`0x1f` handling moved to the record-framed control loop
+// (`VNCConnection+AppleControl.swift`), which parses whole decrypted records in-memory and reassembles a
+// multi-record `0x1f` by declared size — reusing `AppleClipboardCodec.decodeInboundText` for decode.
+// The old socket-incremental handlers here (dispatched from the standard `didReceive` loop) are gone
+// because the HP path no longer runs the standard receive loop.

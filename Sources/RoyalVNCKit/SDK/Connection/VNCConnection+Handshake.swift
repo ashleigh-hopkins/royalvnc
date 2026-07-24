@@ -477,17 +477,13 @@ private extension VNCConnection {
 		// loop (which can't handle Apple HP pseudo-encodings like 0x451).
 		do {
 			try await connection.write(data: Data(setEncodings))   // SetEncodings 0x02 (crib §2b.1)
-			// INTERIM: media (0x1c/UDP) and clipboard both ride the TCP control channel but currently
-			// conflict — the media path skips the standard receive loop (can't decode Apple pseudo-
-			// encodings), while clipboard NEEDS that loop for 0x14/0x1f. Until the HP control-channel
-			// reader handles both, pick one: clipboard-enabled → run the control loops (no media offer);
-			// otherwise → Phase-4 media negotiation. Both keep the misalignment fix (peek removed).
-			if settings.isClipboardRedirectionEnabled {
-				logger.logDebug("[hp] clipboard mode — control loops will run (media offer skipped)")
-			} else {
-				logger.logDebug("[hp] sent SetEncodings (seal() OK); starting media negotiation")
-				try await performHighPerformanceMediaOffer()
-			}
+			// UNIFIED (crib §7): always negotiate media (0x1c/UDP), then the record-framed Apple control
+			// loop (started in connectionDidBecomeReady) carries cursor/layout/clipboard on TCP alongside
+			// the UDP media stream. The old media-vs-clipboard gate is gone: the control loop now survives
+			// Apple pseudo-encodings by record-framing, so both coexist in one HP session. Clipboard
+			// bring-up (0x15 + 0x0b) fires at send-loop start regardless (no-op if redirection is off).
+			logger.logDebug("[hp] sent SetEncodings (seal() OK); starting media negotiation")
+			try await performHighPerformanceMediaOffer()
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "HP media offer",
 																 underlyingError: error)

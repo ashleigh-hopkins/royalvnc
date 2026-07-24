@@ -146,6 +146,13 @@ extension AppleRecordLayerConnection: NetworkConnectionReading {
     /// Read one CBC record off the base (`u16 ciphertext_len || ciphertext`), decrypt + verify it, and
     /// append the recovered body to the plaintext buffer. Advances the receive IV chain and sequence.
     private func readOneRecordIntoBuffer() async throws {
+        recvPlaintextBuffer.append(try await readOneRecordBody())
+    }
+
+    /// Read + decrypt exactly one CBC record and return its recovered plaintext body. Advances the
+    /// receive IV chain and sequence. The record framing is preserved (one record body returned per
+    /// call), which the HP control loop relies on to treat one record as one RFB message.
+    private func readOneRecordBody() async throws -> Data {
         let lengthPrefix = try await base.readBuffered(length: 2)
         let ciphertextLen = (Int(lengthPrefix[lengthPrefix.startIndex]) << 8)
             | Int(lengthPrefix[lengthPrefix.startIndex + 1])
@@ -170,7 +177,28 @@ extension AppleRecordLayerConnection: NetworkConnectionReading {
 
         recvIV = nextIV
         recvSeq &+= 1
-        recvPlaintextBuffer.append(body)
+        return body
+    }
+
+    /// HP control-channel receive: return exactly one decrypted record body = one complete RFB message.
+    /// The sender seals one message per record (see `write`), so record boundaries ARE message
+    /// boundaries — unlike the transparent `read`, this preserves that framing so the HP control loop can
+    /// parse a message in-memory and discard any unparsed tail (e.g. an unknown-length pseudo-encoding
+    /// rect) without desyncing the byte stream (crib §7c). HP-gated: only used by the Apple control loop.
+    ///
+    /// Any plaintext already buffered by a prior transparent `read` (e.g. the media-answer over-read) is
+    /// returned first so nothing is misframed at handover. In the HP flow that buffer is empty at handover
+    /// (each media-answer `read` consumed a whole record body), so this normally reads a fresh record.
+    func readControlMessage() async throws -> Data {
+        guard active else { throw VNCError.protocol(.invalidData) }
+
+        if !recvPlaintextBuffer.isEmpty {
+            let out = recvPlaintextBuffer
+            recvPlaintextBuffer = Data()
+            return out
+        }
+
+        return try await readOneRecordBody()
     }
 }
 
