@@ -240,6 +240,13 @@ extension VNCConnection {
         /// SRTP receive-decryptor for the video stream (per-SSRC ROC state; touched only on videoWorkQueue).
         var srtpDecryptor: AppleSRTPDecryptor?
 
+        /// SRTCP protector + our sender SSRC for on-demand FIR (fast keyframe re-request on packet loss).
+        /// Set once when the keep-alive starts; the protector's SRTCP index is mutated only on `rtcpQueue`
+        /// (both the keep-alive timer and the on-demand FIR dispatch to it → serialized).
+        private var rtcpProtector: AppleSRTCPProtector?
+        private var rtcpSenderSSRC: UInt32 = 0
+        private var lastLossFirNs: UInt64 = 0   // rate-limit (video worker queue only)
+
         // HP HEVC decode pipeline (crib §8): assemble AUs by (ssrc,ts) + marker, depay (DONL/AP/FU), feed
         // one shared VideoToolbox session. All touched only on the video socket queue → no locking.
         var hevcAssembler = AppleHEVCAccessUnitAssembler()
@@ -296,12 +303,37 @@ extension VNCConnection {
             let tile = tileIndex(for: au.ssrc)
             if au.hasGap {
                 hevcDroppedGappedAUs += 1
+                // A dropped (gapped) AU breaks the HEVC reference chain → VT conceals every subsequent
+                // inter-coded AU until a clean IDR. Request an intra refresh NOW rather than waiting up to
+                // 2 s for the periodic keep-alive FIR (rate-limited inside).
+                requestKeyframeOnLoss()
                 let params = nals.filter { (AppleHEVCDepacketizer.nalType($0)).map { !AppleHEVCDepacketizer.isVCL($0) } ?? false }
                 if !params.isEmpty { hevcDecoder.decode(nals: params, context: tile) }
                 return
             }
             hevcDecoder.decode(nals: nals, context: tile)
 #endif
+        }
+
+        /// Send an immediate legacy-FIR (PT=192) to re-root the encoder after packet loss broke the HEVC
+        /// reference chain, instead of waiting for the ≤2 s periodic keep-alive FIR. Rate-limited to ≤~4/s
+        /// so a lossy link can't provoke an IDR storm (each IDR is large → more bytes → more loss). Called
+        /// on the video worker queue; the actual SRTCP protect+send is dispatched to `rtcpQueue` so the
+        /// protector's index stays serialized with the keep-alive timer. Backstopped by the periodic FIR.
+        func requestKeyframeOnLoss() {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now &- lastLossFirNs > 250_000_000 else { return }
+            lastLossFirNs = now
+            guard let protector = rtcpProtector else { return }   // keep-alive not up yet → periodic FIR covers it
+            let ssrc = rtcpSenderSSRC
+            let ctrl = ctrlUDP
+            rtcpQueue.async {
+                if let fir = try? protector.protect(
+                    AppleRTCPBuilders.compoundWithRR(sender: ssrc,
+                                                     payload: AppleRTCPBuilders.firLegacy(target: ssrc))) {
+                    ctrl.send(fir)
+                }
+            }
         }
 
         /// Per-SSRC tile index: sort observed SSRCs ascending; index = position (crib §2, matches the
@@ -351,6 +383,9 @@ extension VNCConnection {
                 logger.logError("[hp-media] could not build SRTCP protector from video_key_v; no RTCP keep-alive")
                 return
             }
+            // Share the protector + sender SSRC with the on-demand loss-recovery FIR (both send via rtcpQueue).
+            self.rtcpProtector = protector
+            self.rtcpSenderSSRC = senderSSRC
             let ctrl = ctrlUDP
             let timer = DispatchSource.makeTimerSource(queue: rtcpQueue)
             timer.schedule(deadline: .now() + 0.5, repeating: .milliseconds(500))
