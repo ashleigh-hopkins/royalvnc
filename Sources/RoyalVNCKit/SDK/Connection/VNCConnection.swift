@@ -66,6 +66,15 @@ public final class VNCConnection: NSObjectOrAnyObject {
 	/// `nil` when no `0x1f` is mid-reassembly. Touched only by the single control-loop task.
 	var appleClipboardReassembly: Data?
 
+	/// HP-only: Apple cursor (`1104`) cache — decoded cursors keyed by the daemon's `cache_id` so a
+	/// later cache-hit rect (`comp_size == 0`) can re-apply a shape without re-sending pixels (crib §7b).
+	/// Touched only by the single control-loop task.
+	var appleCursorCache: [UInt32: VNCCursor] = [:]
+
+	/// Insertion order of `appleCursorCache` keys, for deterministic FIFO eviction (Swift dictionary key
+	/// order is hash-randomized, so evicting `keys.first` could drop a still-live shape → stale OS arrow).
+	var appleCursorCacheOrder: [UInt32] = []
+
 	// T1: guards the fields that Change A/B make genuinely cross-task (the receive loop, the send loop,
 	// the main-thread quality API, and the one-shot watchdog task all touch them). This is the SOLE
 	// access path for `state.areContinuousUpdatesEnabled`, `state.optimisticCUActive`,

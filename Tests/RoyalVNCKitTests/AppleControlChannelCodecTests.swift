@@ -63,7 +63,11 @@ final class AppleControlChannelCodecTests: XCTestCase {
 
     func testCursorCacheHitConsumesEightBytes() {
         let walk = AppleControlChannelCodec.walkFramebufferUpdate(fbu(nRects: 1, cursorRect(w: 24, h: 24, cacheID: 1000, compSize: 0)))
-        XCTAssertEqual(walk, .init(declaredRects: 1, parsedRects: 1, layout: nil, stoppedEarly: false))
+        XCTAssertEqual(walk?.parsedRects, 1)
+        XCTAssertEqual(walk?.stoppedEarly, false)
+        XCTAssertEqual(walk?.cursors.count, 1)
+        XCTAssertEqual(walk?.cursors.first?.isCacheHit, true)
+        XCTAssertEqual(walk?.cursors.first?.cacheID, 1000)
     }
 
     func testCursorFullPixmapConsumesEightPlusCompSize() {
@@ -81,6 +85,53 @@ final class AppleControlChannelCodecTests: XCTestCase {
         let walk = AppleControlChannelCodec.walkFramebufferUpdate(fbu(nRects: 1, r))
         XCTAssertEqual(walk?.parsedRects, 0)
         XCTAssertEqual(walk?.stoppedEarly, true)
+    }
+
+    func testFullCursorRectSurfacesFields() {
+        var r = rectHeader(f0: 3, f1: 5, f2: 12, f3: 14, encoding: 1104)   // hotspot (3,5), 12x14
+        r += be32(42)                                                      // cache_id
+        r += be32(6)                                                       // comp_size
+        r += [1, 2, 3, 4, 5, 6]
+        let walk = AppleControlChannelCodec.walkFramebufferUpdate(fbu(nRects: 1, r))
+        XCTAssertEqual(walk?.cursors.count, 1)
+        let c = walk?.cursors.first
+        XCTAssertEqual(c?.hotspotX, 3); XCTAssertEqual(c?.hotspotY, 5)
+        XCTAssertEqual(c?.width, 12); XCTAssertEqual(c?.height, 14)
+        XCTAssertEqual(c?.cacheID, 42)
+        XCTAssertEqual(c?.isCacheHit, false)
+        XCTAssertEqual(c?.compressed, Data([1, 2, 3, 4, 5, 6]))
+    }
+
+    // MARK: - Cursor pixmap decode (decodeCursorPixmap)
+
+    func testDecodeCursorPixmapRoundTripBGRAtoRGBA() throws {
+        // 2x2 BGRA pixmap (B,G,R,A per pixel) ‖ 2x2 alpha mask → RGBA with alpha from the mask.
+        let w = 2, h = 2
+        let bgra: [UInt8] = [ 10, 20, 30, 99,   40, 50, 60, 99,
+                              70, 80, 90, 99,  100, 110, 120, 99 ]
+        let mask: [UInt8] = [200, 201, 202, 203]
+        let compressed = try ZlibDeflateStream().compressedData(data: Data(bgra + mask))
+
+        let rgba = AppleControlChannelCodec.decodeCursorPixmap(compressed: compressed, width: w, height: h)
+        let expected: [UInt8] = [ 30, 20, 10, 200,   60, 50, 40, 201,
+                                  90, 80, 70, 202,  120, 110, 100, 203 ]
+        XCTAssertEqual(rgba.map { [UInt8]($0) }, expected)
+    }
+
+    func testDecodeCursorPixmapRejectsSizeMismatch() throws {
+        // A stream too short for a 2x2 cursor (needs 2*2*5 = 20 bytes) → nil (benign miss, never fatal).
+        let compressed = try ZlibDeflateStream().compressedData(data: Data([1, 2, 3, 4, 5]))
+        XCTAssertNil(AppleControlChannelCodec.decodeCursorPixmap(compressed: compressed, width: 2, height: 2))
+    }
+
+    func testDecodeCursorPixmapRejectsZeroSize() {
+        XCTAssertNil(AppleControlChannelCodec.decodeCursorPixmap(compressed: Data([0x78, 0x9c]), width: 0, height: 0))
+    }
+
+    func testDecodeCursorPixmapRejectsOversizedDims() {
+        // A hostile u16-max cursor must be rejected before any huge allocation (guard: dim <= 1024).
+        XCTAssertNil(AppleControlChannelCodec.decodeCursorPixmap(compressed: Data([0x78, 0x9c]), width: 65535, height: 65535))
+        XCTAssertNil(AppleControlChannelCodec.decodeCursorPixmap(compressed: Data([0x78, 0x9c]), width: 2000, height: 16))
     }
 
     // MARK: - Display layout 0x451
@@ -116,7 +167,10 @@ final class AppleControlChannelCodecTests: XCTestCase {
     func testMultipleRectsAllConsumed() {
         let rects = configRect(encoding: 1010, size: 12) + cursorRect(w: 24, h: 24, cacheID: 5, compSize: 0)
         let walk = AppleControlChannelCodec.walkFramebufferUpdate(fbu(nRects: 2, rects))
-        XCTAssertEqual(walk, .init(declaredRects: 2, parsedRects: 2, layout: nil, stoppedEarly: false))
+        XCTAssertEqual(walk?.parsedRects, 2)
+        XCTAssertEqual(walk?.stoppedEarly, false)
+        XCTAssertNil(walk?.layout)
+        XCTAssertEqual(walk?.cursors.count, 1)   // the trailing cache-hit cursor is surfaced
     }
 
     /// REALIGNMENT REGRESSION (guards the live type-7 desync class): a rect FOLLOWING a 0x451 must land
@@ -126,9 +180,11 @@ final class AppleControlChannelCodecTests: XCTestCase {
         let rects = layoutRect(prefixLen: 12, scaledW: 1920, scaledH: 1080, backingW: 1920, backingH: 1080)
             + cursorRect(w: 24, h: 24, cacheID: 3, compSize: 0)
         let walk = AppleControlChannelCodec.walkFramebufferUpdate(fbu(nRects: 2, rects))
-        XCTAssertEqual(walk, .init(declaredRects: 2, parsedRects: 2,
-                                   layout: .init(scaledWidth: 1920, scaledHeight: 1080, backingWidth: 1920, backingHeight: 1080),
-                                   stoppedEarly: false))
+        XCTAssertEqual(walk?.parsedRects, 2)
+        XCTAssertEqual(walk?.stoppedEarly, false)
+        XCTAssertEqual(walk?.layout, .init(scaledWidth: 1920, scaledHeight: 1080, backingWidth: 1920, backingHeight: 1080))
+        XCTAssertEqual(walk?.cursors.count, 1)               // follower reached only if layout advanced correctly
+        XCTAssertEqual(walk?.cursors.first?.cacheID, 3)
     }
 
     /// REALIGNMENT REGRESSION: a rect FOLLOWING a nonzero-comp_size cursor must land aligned. Only passes
@@ -138,7 +194,24 @@ final class AppleControlChannelCodecTests: XCTestCase {
         let rects = cursorRect(w: 16, h: 16, cacheID: 7, compSize: 40)
             + configRect(encoding: 1010, size: 12)
         let walk = AppleControlChannelCodec.walkFramebufferUpdate(fbu(nRects: 2, rects))
-        XCTAssertEqual(walk, .init(declaredRects: 2, parsedRects: 2, layout: nil, stoppedEarly: false))
+        XCTAssertEqual(walk?.parsedRects, 2)             // config follower reached only if cursor advanced 8+40
+        XCTAssertEqual(walk?.stoppedEarly, false)
+        XCTAssertEqual(walk?.cursors.count, 1)
+        XCTAssertEqual(walk?.cursors.first?.cacheID, 7)
+        XCTAssertEqual(walk?.cursors.first?.width, 16)
+        XCTAssertEqual(walk?.cursors.first?.compressed.count, 40)
+    }
+
+    /// REALIGNMENT REGRESSION (cache-hit branch): a cache-hit cursor (comp_size=0, body=8) FOLLOWED by
+    /// another rect must land aligned — the follower is reached only if the cursor advanced by exactly 8.
+    func testCacheHitCursorFollowedByKnownRectStaysAligned() {
+        let rects = cursorRect(w: 20, h: 20, cacheID: 9, compSize: 0) + configRect(encoding: 1011, size: 6)
+        let walk = AppleControlChannelCodec.walkFramebufferUpdate(fbu(nRects: 2, rects))
+        XCTAssertEqual(walk?.parsedRects, 2)
+        XCTAssertEqual(walk?.stoppedEarly, false)
+        XCTAssertEqual(walk?.cursors.count, 1)
+        XCTAssertEqual(walk?.cursors.first?.isCacheHit, true)
+        XCTAssertEqual(walk?.cursors.first?.cacheID, 9)
     }
 
     func testLayoutThenUnknownKeepsLayoutAndStopsEarly() {

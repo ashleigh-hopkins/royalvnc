@@ -104,10 +104,60 @@ extension VNCConnection {
             logger.logDebug("[hp-ctl] FBU walk stopped early (\(walk.parsedRects)/\(walk.declaredRects) rects) — record tail discarded, resyncing next record")
         }
 
+        // Cursor (1104) rects: decode/cache/deliver each in wire order (crib §7b).
+        for cursor in walk.cursors {
+            applyAppleCursor(cursor)
+        }
+
         if let layout = walk.layout {
             logger.logDebug("[hp-ctl] AppleDisplayLayout scaled=\(layout.scaledWidth)x\(layout.scaledHeight) backing=\(layout.backingWidth)x\(layout.backingHeight)")
             enqueueAppleCursorRearm(backingWidth: layout.backingWidth, backingHeight: layout.backingHeight)
         }
+    }
+
+    /// Decode/cache/deliver one Apple `1104` cursor rect (crib §7b), reusing the standard `VNCCursor`
+    /// render path (`framebuffer.updateCursor` → `didUpdateCursor` delegate). A cache-hit
+    /// (`comp_size == 0`) re-applies the cached shape, or reverts to the OS default on an unknown
+    /// `cache_id` (reference behavior). A decode failure is logged and skipped — never fatal.
+    private func applyAppleCursor(_ rect: AppleControlChannelCodec.CursorRect) {
+        guard let framebuffer else { return }   // HP framebuffer exists once ServerInit lands
+
+        if rect.isCacheHit {
+            if let cached = appleCursorCache[rect.cacheID] {
+                framebuffer.updateCursor(cached)
+            } else {
+                framebuffer.updateCursor(.empty)   // unknown id → revert to OS default arrow
+            }
+            return
+        }
+
+        guard let rgba = AppleControlChannelCodec.decodeCursorPixmap(compressed: rect.compressed,
+                                                                     width: rect.width,
+                                                                     height: rect.height) else {
+            logger.logDebug("[hp-ctl] cursor decode failed (\(rect.width)x\(rect.height) cache_id=\(rect.cacheID)); skipping")
+            return
+        }
+
+        let cursor = VNCCursor(imageData: rgba,
+                               size: VNCSize(width: UInt16(truncatingIfNeeded: rect.width),
+                                             height: UInt16(truncatingIfNeeded: rect.height)),
+                               hotspot: VNCPoint(x: UInt16(truncatingIfNeeded: rect.hotspotX),
+                                                 y: UInt16(truncatingIfNeeded: rect.hotspotY)),
+                               bitsPerComponent: 8, bitsPerPixel: 32, bytesPerPixel: 4)
+
+        // Cache for later cache-hit refs; bound it (reference uses ~16, we cap at 64). Evict the OLDEST
+        // inserted id (FIFO) — never an arbitrary hash-order key, which could drop a still-live shape and
+        // leave the OS arrow stuck (the daemon won't re-send a pixmap it thinks we still hold).
+        if appleCursorCache[rect.cacheID] == nil {
+            appleCursorCacheOrder.append(rect.cacheID)
+            if appleCursorCacheOrder.count > 64 {
+                let evict = appleCursorCacheOrder.removeFirst()
+                appleCursorCache.removeValue(forKey: evict)
+            }
+        }
+        appleCursorCache[rect.cacheID] = cursor
+        framebuffer.updateCursor(cursor)
+        logger.logDebug("[hp-ctl] cursor \(rect.width)x\(rect.height) hotspot=(\(rect.hotspotX),\(rect.hotspotY)) cache_id=\(rect.cacheID) delivered")
     }
 
     /// Re-arm the daemon's free-running TCP update sender (crib §7d): AutoFrameBufferUpdate `0x09`

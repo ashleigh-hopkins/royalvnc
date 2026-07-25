@@ -28,6 +28,19 @@ enum AppleControlChannelCodec {
         let backingHeight: Int
     }
 
+    /// A `1104` cursor rect surfaced from the walk (crib §7b). `compressed` is EMPTY for a cache-hit
+    /// (`comp_size == 0` → re-apply the cached image for `cacheID`); otherwise it's the
+    /// `zlib(Z_SYNC_FLUSH)` BGRA pixmap ‖ alpha mask to decode via `decodeCursorPixmap`.
+    struct CursorRect: Equatable {
+        let hotspotX: Int
+        let hotspotY: Int
+        let width: Int
+        let height: Int
+        let cacheID: UInt32
+        let compressed: Data
+        var isCacheHit: Bool { compressed.isEmpty }
+    }
+
     /// The outcome of walking one `0x00` FramebufferUpdate record body.
     struct FBUWalk: Equatable {
         /// `n_rects` declared in the FBU header.
@@ -39,6 +52,16 @@ enum AppleControlChannelCodec {
         /// `true` if the walk stopped before all declared rects (unknown encoding or truncation) — the
         /// caller must discard the record tail and resync on the next record.
         let stoppedEarly: Bool
+        /// The `1104` cursor rects consumed, in wire order (for the caller to decode/cache/deliver).
+        let cursors: [CursorRect]
+
+        init(declaredRects: Int, parsedRects: Int, layout: LayoutInfo?, stoppedEarly: Bool, cursors: [CursorRect] = []) {
+            self.declaredRects = declaredRects
+            self.parsedRects = parsedRects
+            self.layout = layout
+            self.stoppedEarly = stoppedEarly
+            self.cursors = cursors
+        }
     }
 
     // MARK: - Encoding numbers (server→client, TCP control channel)
@@ -61,14 +84,18 @@ enum AppleControlChannelCodec {
         var offset = 4
         var parsed = 0
         var lastLayout: LayoutInfo?
+        var cursors: [CursorRect] = []
 
         for _ in 0..<declaredRects {
             // Rect header: f0,f1,f2,f3 (u16 BE ×4) + encoding (s32 BE) = 12 bytes.
             guard offset + 12 <= b.count else {
-                return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: true)
+                return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: true, cursors: cursors)
             }
-            let cursorWidth = readU16(b, offset + 4)      // f2 for a cursor rect
-            let cursorHeight = readU16(b, offset + 6)     // f3 for a cursor rect
+            // For a cursor rect these are hotspot_x, hotspot_y, width, height (crib §7b).
+            let f0 = readU16(b, offset + 0)
+            let f1 = readU16(b, offset + 2)
+            let f2 = readU16(b, offset + 4)
+            let f3 = readU16(b, offset + 6)
             let encoding = Int(Int32(bitPattern: readU32(b, offset + 8)))
             offset += 12
 
@@ -80,22 +107,31 @@ enum AppleControlChannelCodec {
                 let (len, layout) = displayLayoutBody(b, offset)
                 if let layout { lastLayout = layout }
                 bodyLength = len
-                _ = cursorWidth; _ = cursorHeight   // unused for layout rects
             case let e where lengthPrefixedConfigEncodings.contains(e):
                 bodyLength = lengthPrefixedBodyLength(b, offset)
             default:
                 // Unknown encoding (e.g. 1100/1101) — length unknown; stop and resync on next record.
-                return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: true)
+                return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: true, cursors: cursors)
             }
 
             guard let bodyLength, offset + bodyLength <= b.count else {
-                return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: true)
+                return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: true, cursors: cursors)
             }
+
+            if encoding == encCursor {
+                // Bounds guaranteed by the guard above (bodyLength == 8 + comp_size). cache_id @ offset,
+                // comp_size @ offset+4, then comp_size bytes of the zlib pixmap (empty on a cache-hit).
+                let cacheID = readU32(b, offset)
+                let compSize = Int(readU32(b, offset + 4))
+                let compressed = compSize > 0 ? Data(b[(offset + 8)..<(offset + 8 + compSize)]) : Data()
+                cursors.append(CursorRect(hotspotX: f0, hotspotY: f1, width: f2, height: f3, cacheID: cacheID, compressed: compressed))
+            }
+
             offset += bodyLength
             parsed += 1
         }
 
-        return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: false)
+        return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: false, cursors: cursors)
     }
 
     // MARK: - Per-encoding body sizing (bytes past the 12-byte rect header)
@@ -132,6 +168,38 @@ enum AppleControlChannelCodec {
                                 backingHeight: readU16(b, offset + 10))
         }
         return (consumed, layout)
+    }
+
+    // MARK: - Cursor pixmap decode (1104 full rect)
+
+    /// Decode a `1104` cursor pixmap to **RGBA8888** (crib §7b), matching the format the fork's standard
+    /// `decodeCursor` produces (R,G,B,A per pixel) so it flows through the same `VNCCursor`/render path.
+    /// `compressed` is a `zlib(Z_SYNC_FLUSH)` stream of `w*h*4` BGRA pixels ‖ `w*h` alpha-mask bytes;
+    /// alpha is taken from the mask (the pixmap's own 4th byte is ignored, as in the reference). Returns
+    /// `nil` on any decompress/size failure (caller treats it as a benign miss — no session teardown).
+    static func decodeCursorPixmap(compressed: Data, width: Int, height: Int) -> Data? {
+        // Bound the dimensions: cursor w/h come from u16 header fields, so a hostile `65535×65535` with a
+        // tiny comp_size would otherwise drive a ~21 GB allocation (the u16 max). Real Apple cursors are
+        // ≤ ~256 px even at Retina; 1024 is a generous ceiling that caps the buffer at ~5 MB.
+        guard width > 0, height > 0, width <= 1024, height <= 1024 else { return nil }
+        let pixmapSize = width * height * 4
+        let maskSize = width * height
+        let expected = pixmapSize + maskSize
+
+        guard let raw = try? ZlibStream().decompressedData(compressedData: compressed,
+                                                           uncompressedSize: UInt(expected)),
+              raw.count == expected else { return nil }
+
+        let src = [UInt8](raw)
+        var out = [UInt8](repeating: 0, count: pixmapSize)
+        for px in 0..<(width * height) {
+            let o = px * 4
+            out[o]     = src[o + 2]              // R (source is BGRA)
+            out[o + 1] = src[o + 1]              // G
+            out[o + 2] = src[o]                  // B
+            out[o + 3] = src[pixmapSize + px]    // A from the separate mask
+        }
+        return Data(out)
     }
 
     // MARK: - Big-endian readers (assume the caller-checked bounds)
