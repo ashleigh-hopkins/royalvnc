@@ -135,11 +135,16 @@ final class AppleHEVCDecoder {
         decodedWidth = dims.width
         decodedHeight = dims.height
 
-        var decoderSpec: [CFString: Any] = [
-            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true
-        ]
-        if requireHardware {
-            decoderSpec[kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder] = true
+        // The hardware-decoder specification keys are iOS 17+ / macOS 10.9+ (they were macOS-only before
+        // iOS 17). On older iOS, omit them and let VT pick its default decoder (HEVC HW decode still works
+        // where the SoC supports it). macOS (fork tests + harness) always satisfies this, so live behavior
+        // is unchanged there.
+        var decoderSpec: [CFString: Any] = [:]
+        if #available(iOS 17.0, tvOS 17.0, macOS 10.9, *) {
+            decoderSpec[kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder] = true
+            if requireHardware {
+                decoderSpec[kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder] = true
+            }
         }
         // No pixel-format key: let VT negotiate its native output (a forced FourCC risks a false
         // kVTPixelTransferNotSupportedErr for 4:4:4 — crib §3/§5). IOSurface-backed for zero-copy render.
@@ -259,6 +264,8 @@ final class AppleHEVCDecoder {
     /// Whether the session negotiated hardware-accelerated decode (readback; best-effort).
     func isHardwareAccelerated() -> Bool {
         guard let session else { return false }
+        // The readback property key is iOS 17+ / macOS 10.9+ (see the spec-key note above).
+        guard #available(iOS 17.0, tvOS 17.0, macOS 10.9, *) else { return false }
         var value: CFTypeRef?
         let status = VTSessionCopyProperty(
             session,
