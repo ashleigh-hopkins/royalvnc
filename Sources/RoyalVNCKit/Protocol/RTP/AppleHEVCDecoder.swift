@@ -187,16 +187,15 @@ final class AppleHEVCDecoder {
             recordError(noErr)
             return
         }
-        // Asynchronous decode: the feed returns immediately (the HW decode + output handler run on VT's
-        // own thread pool) instead of blocking the caller for the full HW round-trip. This is the key
-        // throughput lever on A18 — a synchronous feed serialized the whole media pipeline on one queue and
-        // the per-frame HW wait capped it far below the source rate. Decode order (hence the cross-tile
-        // reference chain and the single shared DPB) is preserved: VT decodes submitted frames in order.
-        // `onFrame` now fires on a VT thread; the app hook already hops to its own queue, and the counters
-        // it touches are diagnostics only.
-        let asyncFlags: VTDecodeFrameFlags = ._EnableAsynchronousDecompression
+        // SYNCHRONOUS decode (flags: []): the output handler fires inline before this returns, so decode
+        // never falls behind its own feed. Async decode (`kVTDecodeFrame_EnableAsynchronousDecompression`)
+        // was tried for throughput but WEDGED under FMV load on A18 — large frames fed at high rate into the
+        // one shared session backed up VT's async queue and output stopped, and even a fresh self-contained
+        // IDR just queued behind the jam (device: clean IDR fed, hevc-decoded frozen). Async is unnecessary
+        // now: decode runs on the decoupled media worker (fed by the raw-socket recv thread), so a blocking
+        // HW round-trip here no longer stalls UDP intake. Decode order / shared DPB preserved as before.
         let status = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sample, flags: asyncFlags, infoFlagsOut: nil
+            session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
         ) { [weak self] status, _, imageBuffer, _, _ in
             guard let self else { return }
             if status == noErr, let imageBuffer {
