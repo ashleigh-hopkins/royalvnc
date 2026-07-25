@@ -166,8 +166,11 @@ extension VNCConnection {
         private let rtcpQueue = DispatchQueue(label: "hp.rtcp.tx")
         private var rtcpTimer: DispatchSourceTimer?
 
-        // HP HEVC decode pipeline (crib §8): assemble AUs by (ssrc,ts) + marker, depay (DONL/AP/FU), feed
-        // one shared VideoToolbox session. All touched only on the video socket queue → no locking.
+        // HP HEVC decode pipeline (crib §8): assemble AUs by (ssrc,ts)+marker on the SOCKET queue, then hand
+        // each complete AU to the drop-to-live decode stage (`decodeQueue`) which depays (DONL/AP/FU) + feeds
+        // one shared VideoToolbox session. Ownership: `hevcAssembler` is socket-queue-only; `hevcDecoder` +
+        // `hevcKnownSSRCs`/`tileIndex` + the frame/error counters are decodeQueue-only; `pendingAUs` is
+        // `decodeLock`-guarded. Counters read cross-queue by the throttled log are benign (Int, log-only).
         var hevcAssembler = AppleHEVCAccessUnitAssembler()
         private var hevcKnownSSRCs: [UInt32] = []
         private(set) var hevcFramesDecoded = 0
@@ -176,8 +179,23 @@ extension VNCConnection {
 #if canImport(VideoToolbox)
         let hevcDecoder = AppleHEVCDecoder(requireHardware: false)
         /// Set by the app (or a harness) to receive decoded frames — `(pixelBuffer, tileIndex)` — for
-        /// Metal composite/render. Fires on the video socket queue in decode order.
+        /// Metal composite/render. Fires on `decodeQueue` (NOT the socket queue) in decode order; the app
+        /// hop is thread-agnostic (it coalesces under its own lock).
         var onDecodedVideoFrame: ((CVPixelBuffer, UInt32) -> Void)?
+
+        /// Drop-to-live decode decoupling. VideoToolbox decode (the expensive step) is moved OFF the socket
+        /// queue onto `decodeQueue`, so the socket loop re-arms immediately after decrypt+assemble and drains
+        /// UDP at line rate (no kernel-buffer backup → no loss/freeze). Only the NEWEST undecoded AU per tile
+        /// (ssrc) is kept in `pendingAUs`; older ones are DROPPED before decode, so the stream stays live at
+        /// whatever rate the decoder sustains instead of decoding every frame in slow motion. Dropping across
+        /// a non-IDR boundary briefly breaks the HEVC reference chain; VideoToolbox conceals until the next
+        /// IDR (legacy-FIR every 2s + tile-0 re-root). `decodeLock` guards `pendingAUs`/`decodeScheduled`.
+        private let decodeQueue = DispatchQueue(label: "hp.hevc.decode")
+        private let decodeLock = NSLock()
+        private var pendingAUs: [UInt32: AppleHEVCAccessUnitAssembler.CompletedAccessUnit] = [:]
+        private var decodeScheduled = false
+        /// Count of AUs superseded (dropped) before decode to stay live — diagnostic only (decodeLock).
+        private(set) var hevcDroppedLiveAUs = 0
 #endif
 
         init(videoUDP: AppleUDPDatagramConnection, ctrlUDP: AppleUDPDatagramConnection) {
@@ -193,17 +211,49 @@ extension VNCConnection {
                                              sequence: header.sequenceNumber, marker: header.marker,
                                              payload: payload) else { return }
 #if canImport(VideoToolbox)
-            let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads)
-            let tile = tileIndex(for: au.ssrc)
-            if au.hasGap {
-                hevcDroppedGappedAUs += 1
-                let params = nals.filter { (AppleHEVCDepacketizer.nalType($0)).map { !AppleHEVCDepacketizer.isVCL($0) } ?? false }
-                if !params.isEmpty { hevcDecoder.decode(nals: params, context: tile) }
-                return
-            }
-            hevcDecoder.decode(nals: nals, context: tile)
+            // Assemble on the socket queue (cheap); decode off it, dropping stale AUs to stay live.
+            enqueueForDecode(au)
 #endif
         }
+
+#if canImport(VideoToolbox)
+        /// Hand a completed AU to `decodeQueue`, keeping only the newest per tile (drop-to-live). Returns
+        /// on the socket queue immediately so the UDP receive loop re-arms without waiting on decode.
+        private func enqueueForDecode(_ au: AppleHEVCAccessUnitAssembler.CompletedAccessUnit) {
+            decodeLock.lock()
+            if pendingAUs[au.ssrc] != nil { hevcDroppedLiveAUs += 1 }   // superseded an undecoded AU
+            pendingAUs[au.ssrc] = au
+            let schedule = !decodeScheduled
+            if schedule { decodeScheduled = true }
+            decodeLock.unlock()
+            guard schedule else { return }
+            decodeQueue.async { [weak self] in self?.drainDecode() }
+        }
+
+        /// Decode the newest pending AU per tile on `decodeQueue`. Older AUs were dropped by
+        /// `enqueueForDecode` (drop-to-live), so decode always works on the freshest frame per tile and the
+        /// picture stays current instead of playing every frame in slow motion. Gapped AUs harvest params
+        /// only (never feed a partial VCL AU — it wedges VideoToolbox).
+        private func drainDecode() {
+            decodeLock.lock()
+            let aus = pendingAUs
+            pendingAUs.removeAll(keepingCapacity: true)
+            decodeScheduled = false
+            decodeLock.unlock()
+            for ssrc in aus.keys.sorted() {
+                guard let au = aus[ssrc] else { continue }
+                let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads)
+                let tile = tileIndex(for: au.ssrc)
+                if au.hasGap {
+                    hevcDroppedGappedAUs += 1
+                    let params = nals.filter { (AppleHEVCDepacketizer.nalType($0)).map { !AppleHEVCDepacketizer.isVCL($0) } ?? false }
+                    if !params.isEmpty { hevcDecoder.decode(nals: params, context: tile) }
+                    continue
+                }
+                hevcDecoder.decode(nals: nals, context: tile)
+            }
+        }
+#endif
 
         /// Per-SSRC tile index: sort observed SSRCs ascending; index = position (crib §2, matches the
         /// reference convention). NOTE: until all `tileCount` SSRCs have been seen, a lower SSRC observed
@@ -318,7 +368,7 @@ extension VNCConnection {
             // Depay → decode (crib §8). Throttled summary instead of a per-packet line (avoids ~60k logs).
             receiver?.handleDecryptedVideo(header: header, payload: payload, logger: logger)
             if stats.decryptedCount % 1000 == 0 {
-                logger.logDebug("[hp-rtp] decrypted=\(stats.decryptedCount) hevc-decoded=\(receiver?.hevcFramesDecoded ?? 0) droppedGappedAUs=\(receiver?.hevcDroppedGappedAUs ?? 0)")
+                logger.logDebug("[hp-rtp] decrypted=\(stats.decryptedCount) hevc-decoded=\(receiver?.hevcFramesDecoded ?? 0) droppedGappedAUs=\(receiver?.hevcDroppedGappedAUs ?? 0) droppedLiveAUs=\(receiver?.hevcDroppedLiveAUs ?? 0)")
             }
         }, onState: { state in
             logger.logDebug("[hp-media] video UDP(\(videoPort)) state: \(String(describing: state))")
