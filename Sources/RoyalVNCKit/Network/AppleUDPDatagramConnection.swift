@@ -29,7 +29,11 @@ final class AppleUDPDatagramConnection {
     init(host: String, remotePort: UInt16, localPort: UInt16, label: String) {
         self.localPort = localPort
         self.label = label
-        self.queue = DispatchQueue(label: "hp.udp.\(label).\(localPort)")
+        // High QoS: under FMV load the VideoToolbox decode threads + CoreImage composite + main-thread
+        // present saturate the cores, and a default-QoS receive queue gets preempted for up to ~120 ms
+        // (measured cbMaxMs) → the kernel UDP buffer overflows → heavy loss on the high-bitrate tiles.
+        // .userInteractive keeps `receiveMessage` re-arming promptly so datagrams are drained in time.
+        self.queue = DispatchQueue(label: "hp.udp.\(label).\(localPort)", qos: .userInteractive)
 
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true            // SO_REUSEADDR analog
