@@ -7,6 +7,16 @@ import Foundation
 // MARK: - CryptoSwift Implementation
 @_implementationOnly import CryptoSwift
 
+#if canImport(CommonCrypto)
+// Darwin only: the per-packet SRTP hot path (HMAC-SHA1 + AES-256-CTR) runs on CommonCrypto's
+// hardware-accelerated AES. Pure-Swift CryptoSwift costs ~1.6 ms/packet on A18 (measured on device) and
+// saturates the media worker → slow motion; CommonCrypto is ~30× faster. Not a new dependency (Apple
+// system framework); NFR-4/D4 named it the sanctioned fallback and NFR-7 anticipated it. One-shot
+// `CCHmac` + a per-call `CCCryptor` released in `defer` → no persistent `CCCryptorRef` to leak. The
+// one-time KDF (AppleSRTPKeySchedule) stays on CryptoSwift; Linux keeps the CryptoSwift path below.
+import CommonCrypto
+#endif
+
 /// Pure (Foundation + CryptoSwift, no socket) per-packet SRTP receive path for the Apple HP media
 /// path (HP-PHASE4-SPECS §5.4 / crib §3c–§3g). AES-256-CTR cipher + HMAC-SHA1-80 auth.
 ///
@@ -71,9 +81,14 @@ final class AppleSRTPDecryptor {
             var authInput = authInputBody
             authInput.append(contentsOf: bigEndian32(roc))
 
+            let computedTag: [UInt8]
+#if canImport(CommonCrypto)
+            computedTag = Self.hmacSHA1Prefix(key: sessionKeys.authentication, data: authInput, count: Self.authTagLen)
+#else
             guard let digest = try? HMAC(key: Array(sessionKeys.authentication), variant: .sha1)
                 .authenticate(authInput) else { continue }
-            let computedTag = Array(digest.prefix(Self.authTagLen))
+            computedTag = Array(digest.prefix(Self.authTagLen))
+#endif
 
             // Constant-time compare (reuse the Phase-3 pattern — no early-exit `==`).
             guard AppleSRPClient.constantTimeEquals(Data(computedTag), Data(receivedTag)) else {
@@ -144,6 +159,9 @@ final class AppleSRTPDecryptor {
         // RTP packet index is 48-bit: (roc<<16) | seq.
         let index = (UInt64(roc) << 16) | UInt64(seq)
         let iv = AppleSRTPKeySchedule.counterBlock(saltIV16: saltIV, ssrc: ssrc, index: index)
+#if canImport(CommonCrypto)
+        return Self.aesCTRDecrypt(key: sessionKeys.encryption, counterBlock: iv, input: cipherBody)
+#else
         do {
             let aes = try AES(key: Array(sessionKeys.encryption),
                               blockMode: CTR(iv: iv),
@@ -152,7 +170,59 @@ final class AppleSRTPDecryptor {
         } catch {
             return nil
         }
+#endif
     }
+
+#if canImport(CommonCrypto)
+    // MARK: - CommonCrypto hot path (Darwin, hardware AES)
+
+    /// HMAC-SHA1 over `data`, truncated to `count` bytes. One-shot `CCHmac` (no state to leak).
+    private static func hmacSHA1Prefix(key: Data, data: [UInt8], count: Int) -> [UInt8] {
+        var full = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        key.withUnsafeBytes { keyPtr in
+            data.withUnsafeBytes { dataPtr in
+                CCHmac(CCHmacAlgorithm(kCCHmacAlgSHA1),
+                       keyPtr.baseAddress, key.count,
+                       dataPtr.baseAddress, data.count,
+                       &full)
+            }
+        }
+        return Array(full.prefix(count))
+    }
+
+    /// AES-256-CTR over `input` with a 16-byte big-endian initial counter block. CTR is XOR-with-keystream
+    /// (encrypt == decrypt). Big-endian counter increment (`kCCModeOptionCTR_BE`) matches the CryptoSwift
+    /// path + the RFC-3711 / Python oracle the KATs pin against. The `CCCryptor` is released in `defer`
+    /// (per-call, not persistent) so there is no `CCCryptorRef` to leak (NFR-7). Never logs key/IV (NFR-6).
+    private static func aesCTRDecrypt(key: Data, counterBlock: [UInt8], input: [UInt8]) -> Data? {
+        var cryptorOpt: CCCryptorRef?
+        let createStatus = key.withUnsafeBytes { keyPtr -> CCCryptorStatus in
+            counterBlock.withUnsafeBytes { ivPtr -> CCCryptorStatus in
+                CCCryptorCreateWithMode(
+                    CCOperation(kCCEncrypt),
+                    CCMode(kCCModeCTR),
+                    CCAlgorithm(kCCAlgorithmAES),
+                    CCPadding(ccNoPadding),
+                    ivPtr.baseAddress,
+                    keyPtr.baseAddress, key.count,
+                    nil, 0, 0,
+                    CCModeOptions(kCCModeOptionCTR_BE),
+                    &cryptorOpt)
+            }
+        }
+        guard createStatus == kCCSuccess, let cryptor = cryptorOpt else { return nil }
+        defer { CCCryptorRelease(cryptor) }
+
+        var output = [UInt8](repeating: 0, count: input.count)
+        var moved = 0
+        let updateStatus = input.withUnsafeBytes { inPtr in
+            CCCryptorUpdate(cryptor, inPtr.baseAddress, input.count, &output, output.count, &moved)
+        }
+        guard updateStatus == kCCSuccess else { return nil }
+        // CTR is a stream mode → CCCryptorUpdate emits all bytes; CCCryptorFinal produces nothing here.
+        return Data(output.prefix(moved))
+    }
+#endif
 
     // MARK: - Byte helpers
 
