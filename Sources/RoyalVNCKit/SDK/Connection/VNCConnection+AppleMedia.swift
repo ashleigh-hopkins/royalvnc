@@ -294,7 +294,10 @@ extension VNCConnection {
         /// TEMP-MEASUREMENT: last FIR send time (stamped on rtcpQueue at both FIR sites), read on the worker
         /// to log FIR→IDR recovery latency. Benign cross-thread read of a diagnostic timestamp.
         var firSentNs: UInt64 = 0
-        let videoUDP: AppleUDPDatagramConnection
+        /// Video RX uses a raw SOCK_DGRAM socket (large SO_RCVBUF, dedicated recv thread) — NWConnection's
+        /// UDP receive stalls ~200-300ms on device and drops the high-bitrate tiles (measured). Ctrl (RTCP
+        /// TX + low RX) stays on NWConnection.
+        let videoUDP: AppleRawUDPDatagramConnection
         let ctrlUDP: AppleUDPDatagramConnection
         private let rtcpQueue = DispatchQueue(label: "hp.rtcp.tx")
         private var rtcpTimer: DispatchSourceTimer?
@@ -329,7 +332,7 @@ extension VNCConnection {
         var onDecodedVideoFrame: ((CVPixelBuffer, UInt32) -> Void)?
 #endif
 
-        init(videoUDP: AppleUDPDatagramConnection, ctrlUDP: AppleUDPDatagramConnection) {
+        init(videoUDP: AppleRawUDPDatagramConnection, ctrlUDP: AppleUDPDatagramConnection) {
             self.videoUDP = videoUDP
             self.ctrlUDP = ctrlUDP
         }
@@ -509,7 +512,7 @@ extension VNCConnection {
         let ctrlPort = settings.port
         let videoPort = settings.port &+ 1
 
-        let videoUDP = AppleUDPDatagramConnection(host: host, remotePort: videoPort, localPort: videoPort, label: "video")
+        let videoUDP = AppleRawUDPDatagramConnection(host: host, remotePort: videoPort, localPort: videoPort, label: "video")
         let ctrlUDP = AppleUDPDatagramConnection(host: host, remotePort: ctrlPort, localPort: ctrlPort, label: "ctrl")
         let receiver = MediaReceiver(videoUDP: videoUDP, ctrlUDP: ctrlUDP)
         let stats = receiver.stats
@@ -529,10 +532,10 @@ extension VNCConnection {
         // `receiveMessage` re-arms immediately (drains UDP at line rate). All decrypt/assemble/decode work
         // — and the throttled [hp-rtp] summary — runs on the worker (see `enqueueVideoDatagram`).
         videoUDP.start(onDatagram: { [weak receiver] data in
-            receiver?.ingressProbe?.record(datagram: data)   // TEMP-MEASUREMENT (socket queue, pre-worker)
+            receiver?.ingressProbe?.record(datagram: data)   // TEMP-MEASUREMENT (recv thread, pre-worker)
             receiver?.enqueueVideoDatagram(data, logger: logger)
         }, onState: { state in
-            logger.logDebug("[hp-media] video UDP(\(videoPort)) state: \(String(describing: state))")
+            logger.logDebug("[hp-media] video UDP(\(videoPort)) [raw] state: \(state)")
         })
 
         ctrlUDP.start(onDatagram: { _ in stats.addCtrl() }, onState: { state in
