@@ -221,11 +221,79 @@ extension VNCConnection {
         }
     }
 
+    /// TEMP-MEASUREMENT (removed after diagnosis): runs on the video SOCKET queue in `onDatagram`, BEFORE
+    /// the worker handoff, so it measures true INGRESS (what the kernel delivered) independent of the worker.
+    /// SRTP leaves the RTP header in clear → read seq/ssrc with zero decrypt. One `[hp-ingress]` line/sec:
+    ///  - recv/s + per-SSRC recv/gap-events/missing  → wire-loss vs server-under-send (tile starvation)
+    ///  - cbAvgMs/cbMaxMs = socket re-arm cadence; a spike = the serial receive stalled → kernel may drop
+    ///  - postGapMaxMs = inter-arrival of the packet AFTER a gap (large pause ⇒ wire; tight ⇒ our-side)
+    /// Disambiguation: gaps with normal timing + no cadence spike ⇒ WIRE loss; gaps clustered after cadence
+    /// spikes ⇒ RECEIVE-BUFFER overflow. Single-threaded on the socket queue → no locking.
+    final class IngressProbe {
+        private let logger: VNCLogger
+        private var winStartNs: UInt64 = 0
+        private var lastCallbackNs: UInt64 = 0
+        private var lastPacketNs: UInt64 = 0
+        private var callbacks = 0
+        private var cbGapSumNs: UInt64 = 0
+        private var cbMaxGapNs: UInt64 = 0
+        private var postGapMaxMs: Double = 0
+        private var expectedNext: [UInt32: UInt16] = [:]
+        private var recv: [UInt32: Int] = [:]
+        private var gapEvents: [UInt32: Int] = [:]
+        private var missing: [UInt32: Int] = [:]
+
+        init(logger: VNCLogger) { self.logger = logger }
+        private static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+        func record(datagram data: Data) {
+            let now = Self.now()
+            if winStartNs == 0 { winStartNs = now; lastCallbackNs = now; lastPacketNs = now }
+            let cbGap = now &- lastCallbackNs
+            cbGapSumNs &+= cbGap; if cbGap > cbMaxGapNs { cbMaxGapNs = cbGap }; callbacks += 1
+            lastCallbackNs = now
+            if data.count >= 12 {
+                let b = [UInt8](data.prefix(12))
+                let seq = UInt16(b[2]) << 8 | UInt16(b[3])
+                let ssrc = UInt32(b[8]) << 24 | UInt32(b[9]) << 16 | UInt32(b[10]) << 8 | UInt32(b[11])
+                recv[ssrc, default: 0] += 1
+                if let exp = expectedNext[ssrc], seq != exp {
+                    let miss = Int(seq &- exp)   // wraparound-aware; ignore reorder/dup (huge deltas)
+                    if miss > 0 && miss < 30000 {
+                        gapEvents[ssrc, default: 0] += 1
+                        missing[ssrc, default: 0] += miss
+                        let iaMs = Double(now &- lastPacketNs) / 1e6
+                        if iaMs > postGapMaxMs { postGapMaxMs = iaMs }
+                    }
+                }
+                expectedNext[ssrc] = seq &+ 1
+            }
+            lastPacketNs = now
+            let elapsed = now &- winStartNs
+            if elapsed >= 1_000_000_000 {
+                let wallS = Double(elapsed) / 1e9
+                let cbAvgMs = callbacks > 0 ? Double(cbGapSumNs) / Double(callbacks) / 1e6 : 0
+                let parts = recv.keys.sorted().map {
+                    "\($0 & 0xFFFF):r\(recv[$0] ?? 0)g\(gapEvents[$0] ?? 0)m\(missing[$0] ?? 0)"
+                }.joined(separator: " ")
+                logger.logDebug(String(format: "[hp-ingress] recv/s=%.0f cbAvgMs=%.2f cbMaxMs=%.1f postGapMaxMs=%.1f [%@]",
+                                        Double(callbacks) / wallS, cbAvgMs, Double(cbMaxGapNs) / 1e6, postGapMaxMs, parts))
+                winStartNs = now; callbacks = 0; cbGapSumNs = 0; cbMaxGapNs = 0; postGapMaxMs = 0
+                recv.removeAll(keepingCapacity: true); gapEvents.removeAll(keepingCapacity: true); missing.removeAll(keepingCapacity: true)
+            }
+        }
+    }
+
     /// Owns the two UDP media sockets + the RTCP keep-alive loop for the life of the connection.
     final class MediaReceiver {
         let stats = MediaStats()
         /// TEMP-MEASUREMENT (not for commit).
         var profiler: MediaProfiler?
+        /// TEMP-MEASUREMENT: ingress probe on the socket queue (set in `startMediaReceive`).
+        var ingressProbe: IngressProbe?
+        /// TEMP-MEASUREMENT: last FIR send time (stamped on rtcpQueue at both FIR sites), read on the worker
+        /// to log FIR→IDR recovery latency. Benign cross-thread read of a diagnostic timestamp.
+        var firSentNs: UInt64 = 0
         let videoUDP: AppleUDPDatagramConnection
         let ctrlUDP: AppleUDPDatagramConnection
         private let rtcpQueue = DispatchQueue(label: "hp.rtcp.tx")
@@ -301,6 +369,13 @@ extension VNCConnection {
 #if canImport(VideoToolbox)
             let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads)
             let tile = tileIndex(for: au.ssrc)
+            // TEMP-MEASUREMENT: FIR→IDR recovery latency. Log when an IRAP (IDR/CRA/BLA, NAL types 16-23)
+            // AU arrives, incl. whether that recovery IDR itself came in gapped (→ FIR-loop failure mode).
+            if nals.contains(where: { AppleHEVCDepacketizer.nalType($0).map { (16...23).contains($0) } ?? false }) {
+                let fs = firSentNs
+                let sinceFirMs = fs > 0 ? Double(DispatchTime.now().uptimeNanoseconds &- fs) / 1e6 : -1
+                logger.logDebug(String(format: "[hp-idr] IRAP tile=%d hasGap=%@ sinceFIRms=%.0f", Int(tile), au.hasGap ? "Y" : "N", sinceFirMs))
+            }
             if au.hasGap {
                 hevcDroppedGappedAUs += 1
                 // A dropped (gapped) AU breaks the HEVC reference chain → VT conceals every subsequent
@@ -324,6 +399,7 @@ extension VNCConnection {
             let now = DispatchTime.now().uptimeNanoseconds
             guard now &- lastLossFirNs > 250_000_000 else { return }
             lastLossFirNs = now
+            firSentNs = now   // TEMP-MEASUREMENT: stamp FIR-send for FIR→IDR latency
             guard let protector = rtcpProtector else { return }   // keep-alive not up yet → periodic FIR covers it
             let ssrc = rtcpSenderSSRC
             let ctrl = ctrlUDP
@@ -390,7 +466,7 @@ extension VNCConnection {
             let timer = DispatchSource.makeTimerSource(queue: rtcpQueue)
             timer.schedule(deadline: .now() + 0.5, repeating: .milliseconds(500))
             var tick = 0
-            timer.setEventHandler {
+            timer.setEventHandler { [weak self] in
                 tick += 1
                 // Empty RR every tick (peers reject feedback not prefixed by SR/RR).
                 if let rr = try? protector.protect(AppleRTCPBuilders.rrEmpty(sender: senderSSRC)) {
@@ -406,6 +482,7 @@ extension VNCConnection {
                     if let fir = try? protector.protect(
                         AppleRTCPBuilders.compoundWithRR(sender: senderSSRC,
                                                          payload: AppleRTCPBuilders.firLegacy(target: senderSSRC))) {
+                        self?.firSentNs = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
                         ctrl.send(fir)
                     }
                 }
@@ -438,6 +515,7 @@ extension VNCConnection {
         let stats = receiver.stats
         let logger = self.logger
         receiver.profiler = MediaProfiler(logger: logger)   // TEMP-MEASUREMENT
+        receiver.ingressProbe = IngressProbe(logger: logger)   // TEMP-MEASUREMENT
 
         let decryptor = try? AppleSRTPDecryptor(masterBlob: videoKeyS)
         if decryptor == nil { logger.logError("[hp-media] could not build SRTP decryptor from vks") }
@@ -451,6 +529,7 @@ extension VNCConnection {
         // `receiveMessage` re-arms immediately (drains UDP at line rate). All decrypt/assemble/decode work
         // — and the throttled [hp-rtp] summary — runs on the worker (see `enqueueVideoDatagram`).
         videoUDP.start(onDatagram: { [weak receiver] data in
+            receiver?.ingressProbe?.record(datagram: data)   // TEMP-MEASUREMENT (socket queue, pre-worker)
             receiver?.enqueueVideoDatagram(data, logger: logger)
         }, onState: { state in
             logger.logDebug("[hp-media] video UDP(\(videoPort)) state: \(String(describing: state))")
