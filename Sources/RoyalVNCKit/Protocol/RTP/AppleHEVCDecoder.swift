@@ -18,9 +18,11 @@ import CoreVideo
 /// with `nalUnitHeaderLength=4` → one HW-preferred session → 4-byte-length-prefixed sample buffers → sync
 /// output handler) mirrors the HP B1/B2 probes; original code, no AGPL copied.
 ///
-/// Threading: `decode(nals:context:)` is called from a single queue (the media socket queue); the sync
-/// output handler fires inline on that queue before return, so `onFrame` is serialized. Not thread-safe
-/// for concurrent callers by design (the media receiver drives it from one queue).
+/// Threading: `decode(nals:context:)` is called from a single serial queue (the media decode worker).
+/// Decode is ASYNCHRONOUS (`kVTDecodeFrame_EnableAsynchronousDecompression`): the feed returns without
+/// waiting for the HW round-trip, and `onFrame` fires later on VideoToolbox's own output thread (not the
+/// caller's queue). Frames are still decoded in submission order (cross-tile refs / shared DPB preserved).
+/// Not thread-safe for concurrent callers by design (one queue submits; VT serializes output).
 final class AppleHEVCDecoder {
     /// Called with each decoded frame and the caller's `context` tag (the tile index). Fires on the
     /// calling queue, in decode order.
@@ -55,7 +57,12 @@ final class AppleHEVCDecoder {
     deinit { invalidate() }
 
     func invalidate() {
-        if let session { VTDecompressionSessionInvalidate(session) }
+        if let session {
+            // Async decode is in flight; drain queued frames before teardown so a rebuild (DPB swap on a
+            // real param change) or deinit never races the VT output thread or drops in-flight frames.
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            VTDecompressionSessionInvalidate(session)
+        }
         session = nil
     }
 
@@ -180,8 +187,16 @@ final class AppleHEVCDecoder {
             recordError(noErr)
             return
         }
+        // Asynchronous decode: the feed returns immediately (the HW decode + output handler run on VT's
+        // own thread pool) instead of blocking the caller for the full HW round-trip. This is the key
+        // throughput lever on A18 — a synchronous feed serialized the whole media pipeline on one queue and
+        // the per-frame HW wait capped it far below the source rate. Decode order (hence the cross-tile
+        // reference chain and the single shared DPB) is preserved: VT decodes submitted frames in order.
+        // `onFrame` now fires on a VT thread; the app hook already hops to its own queue, and the counters
+        // it touches are diagnostics only.
+        let asyncFlags: VTDecodeFrameFlags = ._EnableAsynchronousDecompression
         let status = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
+            session, sampleBuffer: sample, flags: asyncFlags, infoFlagsOut: nil
         ) { [weak self] status, _, imageBuffer, _, _ in
             guard let self else { return }
             if status == noErr, let imageBuffer {

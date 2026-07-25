@@ -158,13 +158,87 @@ extension VNCConnection {
         func addCtrl() { lock.lock(); _ctrl += 1; lock.unlock() }
     }
 
+    /// TEMP-MEASUREMENT (removed after on-device verify): localizes the live throughput limiter. All calls
+    /// happen on the single video *worker* queue (post-decouple) → no locking. One `[hp-prof]` line/wall-sec:
+    ///  - busyFrac  = Σ(worker exit−entry)/wall  → worker-queue compute saturation (≈1.0 = compute-bound)
+    ///  - decryptMs / decodeMs = mean per-packet SRTP-decrypt vs assemble+decode cost
+    ///  - AU/s, pkts/AU, gappedAU/s
+    ///  - speed = media-elapsed / wall-elapsed (RTP ts@90kHz vs wallclock; <1.0 = slow motion, = the slope)
+    final class MediaProfiler {
+        private let logger: VNCLogger
+        private var winStartNs: UInt64 = 0
+        private var busyNs: UInt64 = 0
+        private var decryptNs: UInt64 = 0
+        private var decodeNs: UInt64 = 0
+        private var pkts = 0
+        private var aus = 0
+        private var gappedAus = 0
+        // Drift reference: track one ssrc's AU timestamp span vs wallclock.
+        private var refSSRC: UInt32?
+        private var firstTs: UInt32 = 0
+        private var lastTs: UInt32 = 0
+        private var firstWallNs: UInt64 = 0
+        private var lastWallNs: UInt64 = 0
+
+        init(logger: VNCLogger) { self.logger = logger }
+
+        private static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+        /// Record one datagram's timing. `decryptNs`/`decodeNs` are the sub-costs inside `busyNs`.
+        func recordPacket(busyNs b: UInt64, decryptNs d: UInt64, decodeNs c: UInt64) {
+            let t = Self.now()
+            if winStartNs == 0 { winStartNs = t }
+            busyNs += b; decryptNs += d; decodeNs += c; pkts += 1
+            let elapsed = t - winStartNs
+            if elapsed >= 1_000_000_000 {
+                let wallS = Double(elapsed) / 1e9
+                let busyFrac = Double(busyNs) / Double(elapsed)
+                let decMs = pkts > 0 ? Double(decryptNs) / Double(pkts) / 1e6 : 0
+                let codMs = aus > 0 ? Double(decodeNs) / Double(aus) / 1e6 : 0
+                let auRate = Double(aus) / wallS
+                let pktsPerAU = aus > 0 ? Double(pkts) / Double(aus) : 0
+                var speed = 0.0
+                if lastWallNs > firstWallNs {
+                    let mediaS = Double(lastTs &- firstTs) / 90_000.0
+                    let driftWallS = Double(lastWallNs - firstWallNs) / 1e9
+                    if driftWallS > 0 { speed = mediaS / driftWallS }
+                }
+                logger.logDebug(String(format: "[hp-prof] busyFrac=%.2f decryptMs=%.3f decodeMs=%.3f AU/s=%.1f pktsPerAU=%.1f gappedAU/s=%.1f speed=%.3f pkts=%d",
+                                        busyFrac, decMs, codMs, auRate, pktsPerAU, Double(gappedAus) / wallS, speed, pkts))
+                winStartNs = t; busyNs = 0; decryptNs = 0; decodeNs = 0; pkts = 0; aus = 0; gappedAus = 0
+            }
+        }
+
+        /// Record a completed AU (for AU/s + drift). Called from `handleDecryptedVideo`.
+        func recordAU(ssrc: UInt32, timestamp: UInt32, hasGap: Bool) {
+            aus += 1
+            if hasGap { gappedAus += 1 }
+            if refSSRC == nil { refSSRC = ssrc }
+            guard ssrc == refSSRC else { return }
+            let t = Self.now()
+            if firstWallNs == 0 { firstWallNs = t; firstTs = timestamp }
+            lastWallNs = t; lastTs = timestamp
+        }
+    }
+
     /// Owns the two UDP media sockets + the RTCP keep-alive loop for the life of the connection.
     final class MediaReceiver {
         let stats = MediaStats()
+        /// TEMP-MEASUREMENT (not for commit).
+        var profiler: MediaProfiler?
         let videoUDP: AppleUDPDatagramConnection
         let ctrlUDP: AppleUDPDatagramConnection
         private let rtcpQueue = DispatchQueue(label: "hp.rtcp.tx")
         private var rtcpTimer: DispatchSourceTimer?
+
+        /// Serial worker that runs decrypt→assemble→(async)decode OFF the UDP socket queue so the socket can
+        /// re-arm `receiveMessage` immediately and drain at line rate. The synchronous pipeline on the socket
+        /// queue was the throughput ceiling on A18 (per-frame HW-decode wait blocked UDP intake → kernel
+        /// backlog → unbounded latency = slow motion → overflow). FIFO → packet/AU/decode order preserved.
+        /// No drop (sparse-IDR stream: dropping any non-IDR AU breaks the cross-tile reference chain).
+        private let videoWorkQueue = DispatchQueue(label: "hp.media.video.decode")
+        /// SRTP receive-decryptor for the video stream (per-SSRC ROC state; touched only on videoWorkQueue).
+        var srtpDecryptor: AppleSRTPDecryptor?
 
         // HP HEVC decode pipeline (crib §8): assemble AUs by (ssrc,ts) + marker, depay (DONL/AP/FU), feed
         // one shared VideoToolbox session. All touched only on the video socket queue → no locking.
@@ -185,13 +259,38 @@ extension VNCConnection {
             self.ctrlUDP = ctrlUDP
         }
 
-        /// Assemble → depay → decode one decrypted video RTP packet (crib §8). Called on the video socket
+        /// Hand one raw video datagram to the serial worker: decrypt → assemble → (async) decode. Returns
+        /// immediately so the UDP socket queue re-arms `receiveMessage` at once (drains at line rate). The
+        /// worker is FIFO so per-SSRC ROC / AU assembly / decode order are preserved. No drop.
+        func enqueueVideoDatagram(_ data: Data, logger: VNCLogger) {
+            videoWorkQueue.async { [weak self] in
+                guard let self else { return }
+                let t0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
+                self.stats.addVideo()
+                guard let dec = self.srtpDecryptor, let (header, payload) = dec.decrypt(packet: data) else {
+                    let te = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
+                    self.profiler?.recordPacket(busyNs: te - t0, decryptNs: te - t0, decodeNs: 0)
+                    return
+                }
+                let tDec = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
+                self.stats.addDecrypted()
+                self.handleDecryptedVideo(header: header, payload: payload, logger: logger)
+                let t1 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
+                self.profiler?.recordPacket(busyNs: t1 - t0, decryptNs: tDec - t0, decodeNs: t1 - tDec)
+                if self.stats.decryptedCount % 1000 == 0 {
+                    logger.logDebug("[hp-rtp] decrypted=\(self.stats.decryptedCount) hevc-decoded=\(self.hevcFramesDecoded) droppedGappedAUs=\(self.hevcDroppedGappedAUs)")
+                }
+            }
+        }
+
+        /// Assemble → depay → decode one decrypted video RTP packet (crib §8). Called on the video worker
         /// queue (single-threaded). A completed AU with a sequence gap is dropped after harvesting any
         /// parameter sets it carries (never feed a partial VCL AU — it wedges VideoToolbox).
         func handleDecryptedVideo(header: AppleRTPHeader, payload: Data, logger: VNCLogger) {
             guard let au = hevcAssembler.add(ssrc: header.ssrc, timestamp: header.timestamp,
                                              sequence: header.sequenceNumber, marker: header.marker,
                                              payload: payload) else { return }
+            profiler?.recordAU(ssrc: au.ssrc, timestamp: au.timestamp, hasGap: au.hasGap)   // TEMP-MEASUREMENT
 #if canImport(VideoToolbox)
             let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads)
             let tile = tileIndex(for: au.ssrc)
@@ -303,23 +402,21 @@ extension VNCConnection {
         let receiver = MediaReceiver(videoUDP: videoUDP, ctrlUDP: ctrlUDP)
         let stats = receiver.stats
         let logger = self.logger
+        receiver.profiler = MediaProfiler(logger: logger)   // TEMP-MEASUREMENT
 
         let decryptor = try? AppleSRTPDecryptor(masterBlob: videoKeyS)
         if decryptor == nil { logger.logError("[hp-media] could not build SRTP decryptor from vks") }
+        receiver.srtpDecryptor = decryptor
 
 #if canImport(VideoToolbox)
         receiver.startHEVCDecode(logger: logger)
 #endif
 
+        // Socket-queue callback is now trivial: hand the raw datagram to the serial worker and return so
+        // `receiveMessage` re-arms immediately (drains UDP at line rate). All decrypt/assemble/decode work
+        // — and the throttled [hp-rtp] summary — runs on the worker (see `enqueueVideoDatagram`).
         videoUDP.start(onDatagram: { [weak receiver] data in
-            stats.addVideo()
-            guard let dec = decryptor, let (header, payload) = dec.decrypt(packet: data) else { return }
-            stats.addDecrypted()
-            // Depay → decode (crib §8). Throttled summary instead of a per-packet line (avoids ~60k logs).
-            receiver?.handleDecryptedVideo(header: header, payload: payload, logger: logger)
-            if stats.decryptedCount % 1000 == 0 {
-                logger.logDebug("[hp-rtp] decrypted=\(stats.decryptedCount) hevc-decoded=\(receiver?.hevcFramesDecoded ?? 0) droppedGappedAUs=\(receiver?.hevcDroppedGappedAUs ?? 0)")
-            }
+            receiver?.enqueueVideoDatagram(data, logger: logger)
         }, onState: { state in
             logger.logDebug("[hp-media] video UDP(\(videoPort)) state: \(String(describing: state))")
         })
