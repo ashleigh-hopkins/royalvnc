@@ -10,6 +10,10 @@ import Dispatch
 import Network
 #endif
 
+#if canImport(VideoToolbox)
+import CoreVideo
+#endif
+
 #if canImport(ObjectiveC)
 @objc(VNCConnection)
 #endif
@@ -148,6 +152,11 @@ public final class VNCConnection: NSObjectOrAnyObject {
 
 	/// Whether a background HP media session is active (platform-safe accessor for logging/wiring).
 	var appleHPMediaReceiverActive: Bool { appleHPMediaReceiver != nil }
+
+	/// HP-only: set (before connecting) to receive decoded HEVC video frames — `(pixelBuffer, tileIndex)`
+	/// — for Metal composite/render. Propagated to the media receiver when media negotiation creates it;
+	/// frames arrive on the media socket queue in decode order. `nil` on the standard path.
+	public var appleHPDecodedVideoFrameHandler: ((CVPixelBuffer, UInt32) -> Void)?
 #else
 	/// No media receiver on non-Network platforms (control-channel HP still runs).
 	var appleHPMediaReceiverActive: Bool { false }

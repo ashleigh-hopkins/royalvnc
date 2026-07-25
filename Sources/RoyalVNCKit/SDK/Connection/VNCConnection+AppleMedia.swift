@@ -4,6 +4,11 @@ import FoundationEssentials
 import Foundation
 #endif
 
+#if canImport(VideoToolbox)
+import VideoToolbox
+import CoreVideo
+#endif
+
 /// Apple HP media negotiation over the armed AES-128-CBC control record layer (HP-PHASE4-SPECS
 /// §4.3 / crib §2b). Runs immediately after `performHighPerformanceControlBringUp` arms the record
 /// layer: sends the `0x1c` MediaStreamConfiguration offer, reads the `0x1c` answer (a standard
@@ -98,6 +103,9 @@ extension VNCConnection {
             #if canImport(Network)
             if let media {
                 media.startRTCPKeepAlive(videoKeyV: vkv, senderSSRC: ssrcs?.video ?? 0, logger: logger)
+                #if canImport(VideoToolbox)
+                media.onDecodedVideoFrame = appleHPDecodedVideoFrameHandler
+                #endif
                 appleHPMediaReceiver = media
             }
             #endif
@@ -158,10 +166,83 @@ extension VNCConnection {
         private let rtcpQueue = DispatchQueue(label: "hp.rtcp.tx")
         private var rtcpTimer: DispatchSourceTimer?
 
+        // HP HEVC decode pipeline (crib §8): assemble AUs by (ssrc,ts) + marker, depay (DONL/AP/FU), feed
+        // one shared VideoToolbox session. All touched only on the video socket queue → no locking.
+        var hevcAssembler = AppleHEVCAccessUnitAssembler()
+        private var hevcKnownSSRCs: [UInt32] = []
+        private(set) var hevcFramesDecoded = 0
+        private var hevcLoggedFirstFrame = false
+        private(set) var hevcDroppedGappedAUs = 0
+#if canImport(VideoToolbox)
+        let hevcDecoder = AppleHEVCDecoder(requireHardware: false)
+        /// Set by the app (or a harness) to receive decoded frames — `(pixelBuffer, tileIndex)` — for
+        /// Metal composite/render. Fires on the video socket queue in decode order.
+        var onDecodedVideoFrame: ((CVPixelBuffer, UInt32) -> Void)?
+#endif
+
         init(videoUDP: AppleUDPDatagramConnection, ctrlUDP: AppleUDPDatagramConnection) {
             self.videoUDP = videoUDP
             self.ctrlUDP = ctrlUDP
         }
+
+        /// Assemble → depay → decode one decrypted video RTP packet (crib §8). Called on the video socket
+        /// queue (single-threaded). A completed AU with a sequence gap is dropped after harvesting any
+        /// parameter sets it carries (never feed a partial VCL AU — it wedges VideoToolbox).
+        func handleDecryptedVideo(header: AppleRTPHeader, payload: Data, logger: VNCLogger) {
+            guard let au = hevcAssembler.add(ssrc: header.ssrc, timestamp: header.timestamp,
+                                             sequence: header.sequenceNumber, marker: header.marker,
+                                             payload: payload) else { return }
+#if canImport(VideoToolbox)
+            let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads)
+            let tile = tileIndex(for: au.ssrc)
+            if au.hasGap {
+                hevcDroppedGappedAUs += 1
+                let params = nals.filter { (AppleHEVCDepacketizer.nalType($0)).map { !AppleHEVCDepacketizer.isVCL($0) } ?? false }
+                if !params.isEmpty { hevcDecoder.decode(nals: params, context: tile) }
+                return
+            }
+            hevcDecoder.decode(nals: nals, context: tile)
+#endif
+        }
+
+        /// Per-SSRC tile index: sort observed SSRCs ascending; index = position (crib §2, matches the
+        /// reference convention). NOTE: until all `tileCount` SSRCs have been seen, a lower SSRC observed
+        /// after a higher one shifts earlier indices up by one — a self-healing startup transient (at most
+        /// the first frame or two) that steady state resolves to the reference's fixed map. When the app
+        /// compositor lands it should freeze the map once `canvas.tileCount` distinct SSRCs are observed
+        /// (and buffer/drop the first partial composite) rather than trust provisional early indices.
+        private func tileIndex(for ssrc: UInt32) -> UInt32 {
+            if !hevcKnownSSRCs.contains(ssrc) {
+                hevcKnownSSRCs.append(ssrc)
+                hevcKnownSSRCs.sort()
+            }
+            return UInt32(hevcKnownSSRCs.firstIndex(of: ssrc) ?? 0)
+        }
+
+#if canImport(VideoToolbox)
+        /// Wire the decoder's output/error callbacks (frame counting + first-frame log + forward to the
+        /// app render hook). Call once before the video socket starts delivering.
+        func startHEVCDecode(logger: VNCLogger) {
+            hevcDecoder.onFrame = { [weak self] pixelBuffer, tile in
+                guard let self else { return }
+                self.hevcFramesDecoded += 1
+                if !self.hevcLoggedFirstFrame {
+                    self.hevcLoggedFirstFrame = true
+                    let w = CVPixelBufferGetWidth(pixelBuffer)
+                    let h = CVPixelBufferGetHeight(pixelBuffer)
+                    let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
+                    let f = [UInt8((fmt >> 24) & 0xFF), UInt8((fmt >> 16) & 0xFF), UInt8((fmt >> 8) & 0xFF), UInt8(fmt & 0xFF)]
+                    let fstr = String(bytes: f, encoding: .ascii) ?? String(fmt)
+                    logger.logDebug("[hp-hevc] FIRST decoded frame \(w)x\(h) pixelFormat=\(fstr) hw=\(self.hevcDecoder.isHardwareAccelerated()) tile=\(tile)")
+                }
+                self.onDecodedVideoFrame?(pixelBuffer, tile)
+            }
+            var loggedError = false
+            hevcDecoder.onDecodeError = { status in
+                if !loggedError { loggedError = true; logger.logDebug("[hp-hevc] first decode error OSStatus \(status) (VT conceals; continuing)") }
+            }
+        }
+#endif
 
         /// Start the 0.5 s RTCP TX keep-alive out the ctrl socket (crib §4g): SRTCP-protected empty RR
         /// each tick + empty SR every 5 s + a legacy-FIR (PT=192) periodically. Keeps AVConference
@@ -226,12 +307,19 @@ extension VNCConnection {
         let decryptor = try? AppleSRTPDecryptor(masterBlob: videoKeyS)
         if decryptor == nil { logger.logError("[hp-media] could not build SRTP decryptor from vks") }
 
-        videoUDP.start(onDatagram: { data in
+#if canImport(VideoToolbox)
+        receiver.startHEVCDecode(logger: logger)
+#endif
+
+        videoUDP.start(onDatagram: { [weak receiver] data in
             stats.addVideo()
             guard let dec = decryptor, let (header, payload) = dec.decrypt(packet: data) else { return }
             stats.addDecrypted()
-            let prefix = payload.prefix(16).map { String(format: "%02x", $0) }.joined()
-            logger.logDebug("[hp-rtp] PT=\(header.payloadType) ssrc=\(header.ssrc) seq=\(header.sequenceNumber) ts=\(header.timestamp) marker=\(header.marker) len=\(payload.count) h[\(prefix)]")
+            // Depay → decode (crib §8). Throttled summary instead of a per-packet line (avoids ~60k logs).
+            receiver?.handleDecryptedVideo(header: header, payload: payload, logger: logger)
+            if stats.decryptedCount % 1000 == 0 {
+                logger.logDebug("[hp-rtp] decrypted=\(stats.decryptedCount) hevc-decoded=\(receiver?.hevcFramesDecoded ?? 0) droppedGappedAUs=\(receiver?.hevcDroppedGappedAUs ?? 0)")
+            }
         }, onState: { state in
             logger.logDebug("[hp-media] video UDP(\(videoPort)) state: \(String(describing: state))")
         })
