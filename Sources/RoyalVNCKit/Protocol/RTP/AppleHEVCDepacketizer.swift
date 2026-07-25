@@ -33,9 +33,16 @@ enum AppleHEVCDepacketizer {
     /// Depacketize one access unit's RTP payloads (already ordered by sequence number) into complete NAL
     /// units. Handles single-NAL (type 0…47), Aggregation Packets (48), and Fragmentation Units (49),
     /// stripping Apple's 16-bit DONL. Each returned `Data` begins with the reconstructed 2-byte NAL header.
-    static func depacketizeAccessUnit(_ orderedPayloads: [Data]) -> [Data] {
+    static func depacketizeAccessUnit(_ orderedPayloads: [Data], donl: Bool = true) -> [Data] {
         var nals: [Data] = []
         var fuAccumulator: Data?   // in-progress reassembled FU NAL (nil unless mid-fragment)
+
+        // Apple's 16-bit DONL is present on SOME streams (4-tile) but NOT others (single-tile, tilesPerFrame=1).
+        // `donl` selects the byte layout: AP = APhdr[2] (+DONL[2]); FU fragment = FUhdr[2]+FUheader[1] (+DONL[2]);
+        // single NAL = NALhdr[2] (+DONL[2]). Getting this wrong drops the AP's parameter sets and corrupts FUs.
+        let apStart = donl ? 4 : 2
+        let fuStart = donl ? 5 : 3
+        let singleStart = donl ? 4 : 2
 
         for payload in orderedPayloads {
             let b = [UInt8](payload)
@@ -43,8 +50,8 @@ enum AppleHEVCDepacketizer {
 
             switch type {
             case nalTypeAggregationPacket:
-                // APhdr[2] | DONL[2] | { size[2 BE] | NAL bytes }…  — no per-NAL DOND.
-                var offset = 4
+                // APhdr[2] (| DONL[2]) | { size[2 BE] | NAL bytes }…  — no per-NAL DOND.
+                var offset = apStart
                 while offset + 2 <= b.count {
                     let size = (Int(b[offset]) << 8) | Int(b[offset + 1])
                     offset += 2
@@ -54,8 +61,8 @@ enum AppleHEVCDepacketizer {
                 }
 
             case nalTypeFragmentationUnit:
-                // FUhdr[2] | FUheader[1] | DONL[2] | fragment… — DONL in every fragment.
-                guard b.count >= 6 else { continue }
+                // FUhdr[2] | FUheader[1] (| DONL[2]) | fragment…
+                guard b.count > fuStart else { continue }
                 let fuHeader = b[2]
                 let isStart = (fuHeader & 0x80) != 0
                 let isEnd = (fuHeader & 0x40) != 0
@@ -63,13 +70,13 @@ enum AppleHEVCDepacketizer {
 
                 if isStart {
                     // Reconstruct the inner NAL header: keep forbidden bit + high layer-id from byte0,
-                    // substitute the real type; byte1 unchanged. Then the fragment payload after DONL.
+                    // substitute the real type; byte1 unchanged. Then the fragment payload after (DONL).
                     let byte0 = (b[0] & 0x81) | (innerType << 1)
                     var nal = Data([byte0, b[1]])
-                    nal.append(contentsOf: b[5...])
+                    nal.append(contentsOf: b[fuStart...])
                     fuAccumulator = nal
                 } else if fuAccumulator != nil {
-                    fuAccumulator!.append(contentsOf: b[5...])
+                    fuAccumulator!.append(contentsOf: b[fuStart...])
                 }
 
                 if isEnd, let done = fuAccumulator {
@@ -78,15 +85,30 @@ enum AppleHEVCDepacketizer {
                 }
 
             default:
-                // Single NAL (type 0…47): NALhdr[2] | DONL[2] | payload.
-                guard b.count >= 4 else { continue }
+                // Single NAL (type 0…47): NALhdr[2] (| DONL[2]) | payload.
+                guard b.count > singleStart else { continue }
                 var nal = Data(b[0..<2])
-                nal.append(contentsOf: b[4...])
+                nal.append(contentsOf: b[singleStart...])
                 nals.append(nal)
             }
         }
 
         return nals
+    }
+
+    /// Detect whether Apple's 16-bit DONL is present, from an Aggregation Packet (the parameter-set AP).
+    /// No-DONL layout is `APhdr[2] | size[2] | NAL…`; if that size fits and the first NAL is a parameter-set
+    /// type (VPS/SPS/PPS), DONL is absent. Otherwise assume present (the 4-tile default). Returns `nil` if
+    /// the payload isn't an AP (undetectable from this packet).
+    static func detectDONL(fromAggregationPacket payload: Data) -> Bool? {
+        let b = [UInt8](payload)
+        guard b.count >= 6, nalType(payload) == nalTypeAggregationPacket else { return nil }
+        let size = (Int(b[2]) << 8) | Int(b[3])
+        if size >= 2, 4 + size <= b.count {
+            let t = Int((b[4] >> 1) & 0x3F)
+            if t == nalTypeVPS || t == nalTypeSPS || t == nalTypePPS { return false }
+        }
+        return true
     }
 }
 

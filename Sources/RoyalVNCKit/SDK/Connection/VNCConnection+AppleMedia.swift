@@ -53,9 +53,13 @@ extension VNCConnection {
             audioSessionID: try Self.random32(rnd), audioTimestamp: Self.nowNanos(),
             audioPlistCallID: UUID())
 
+        // tilesPerFrame=1: one self-contained full-frame stream (like Apple's own client) → every frame
+        // IDR-recoverable → any loss recovers on the next FIR-IDR, fixing the 4-tile tile-1-3-can't-recover
+        // stalls. screensharingd honors it (single SSRC). Making the fork decode the single 1920×1080 stream
+        // is under active work (WIP).
         let config = Apple0x1cOffer.Config(
             flags: .standard,
-            blob: .init(),
+            blob: .init(tilesPerFrame: 1),
             remoteEndpointInfo: AppleMediaBlobCodec.buildRemoteEndpointInfo(hwModel: "Mac", avcVersion: "1.0.0", osBuild: "0"))
 
         let offer = try Apple0x1cOffer.build(config: config, params: params)
@@ -294,6 +298,7 @@ extension VNCConnection {
         /// TEMP-MEASUREMENT: last FIR send time (stamped on rtcpQueue at both FIR sites), read on the worker
         /// to log FIR→IDR recovery latency. Benign cross-thread read of a diagnostic timestamp.
         var firSentNs: UInt64 = 0
+        var rawDiagCount = 0   // TEMP: single-tile out-of-band param location
         /// Video RX uses a raw SOCK_DGRAM socket (large SO_RCVBUF, dedicated recv thread) — NWConnection's
         /// UDP receive stalls ~200-300ms on device and drops the high-bitrate tiles (measured). Ctrl (RTCP
         /// TX + low RX) stays on NWConnection.
@@ -321,6 +326,10 @@ extension VNCConnection {
         // HP HEVC decode pipeline (crib §8): assemble AUs by (ssrc,ts) + marker, depay (DONL/AP/FU), feed
         // one shared VideoToolbox session. All touched only on the video socket queue → no locking.
         var hevcAssembler = AppleHEVCAccessUnitAssembler()
+        /// Whether Apple's 16-bit DONL is present in this stream's RTP payloads. Present on 4-tile streams,
+        /// ABSENT on single-tile (tilesPerFrame=1). Auto-detected from the parameter-set Aggregation Packet;
+        /// defaults to true (4-tile behavior) until an AP is seen. Getting it wrong drops params / corrupts FUs.
+        private var hevcDONL = true
         private var hevcKnownSSRCs: [UInt32] = []
         private(set) var hevcFramesDecoded = 0
         private var hevcLoggedFirstFrame = false
@@ -352,6 +361,11 @@ extension VNCConnection {
                 }
                 let tDec = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
                 self.stats.addDecrypted()
+                if self.rawDiagCount < 60 {   // TEMP: locate out-of-band params for single-tile stream
+                    self.rawDiagCount += 1
+                    let p = [UInt8](payload.prefix(6))
+                    logger.logDebug("[hp-raw] pt=\(header.payloadType) ssrc=\(header.ssrc & 0xFFFF) seq=\(header.sequenceNumber) mark=\(header.marker) len=\(payload.count) first=\(p.map { String(format: "%02x", $0) }.joined())")
+                }
                 self.handleDecryptedVideo(header: header, payload: payload, logger: logger)
                 let t1 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
                 self.profiler?.recordPacket(busyNs: t1 - t0, decryptNs: tDec - t0, decodeNs: t1 - tDec)
@@ -370,7 +384,12 @@ extension VNCConnection {
                                              payload: payload) else { return }
             profiler?.recordAU(ssrc: au.ssrc, timestamp: au.timestamp, hasGap: au.hasGap)   // TEMP-MEASUREMENT
 #if canImport(VideoToolbox)
-            let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads)
+            // Auto-detect DONL presence from the parameter-set AP (single-tile omits it); apply per-stream.
+            if let first = au.orderedPayloads.first,
+               let detected = AppleHEVCDepacketizer.detectDONL(fromAggregationPacket: first) {
+                hevcDONL = detected
+            }
+            let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads, donl: hevcDONL)
             let tile = tileIndex(for: au.ssrc)
             // TEMP-MEASUREMENT: FIR→IDR recovery latency. Log when an IRAP (IDR/CRA/BLA, NAL types 16-23)
             // AU arrives, incl. whether that recovery IDR itself came in gapped (→ FIR-loop failure mode).

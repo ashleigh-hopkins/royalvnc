@@ -44,6 +44,7 @@ final class AppleHEVCDecoder {
     /// never wipe the DPB (crib §3 risk 7). A genuine SPS/resolution change rebuilds.
     private var builtSignature: Data?
 
+    private var diagCount = 0   // TEMP: single-tile decode diagnosis (not DEBUG-guarded; harness builds release)
     private(set) var framesDecoded = 0
     private(set) var decodeErrors = 0
     private(set) var negotiatedPixelFormat: OSType?
@@ -72,6 +73,15 @@ final class AppleHEVCDecoder {
     func decode(nals: [Data], context: UInt32) {
         harvestParameterSets(nals)
         rebuildIfParametersChanged()
+
+        if diagCount < 60 {
+            diagCount += 1
+            let types = nals.map { nal -> String in
+                let t = AppleHEVCDepacketizer.nalType(nal).map { Int($0) } ?? -1
+                return "\(t)(\(nal.count))"
+            }
+            print("[hp-dec] ctx=\(context) nals=\(types) vps=\(vps != nil) sps=\(sps != nil) pps=\(ppsList.count) session=\(session != nil)")
+        }
 
         guard let session, let formatDescription else { return }
 
