@@ -7,6 +7,17 @@ import Foundation
 // MARK: - CryptoSwift Implementation
 @_implementationOnly import CryptoSwift
 
+#if canImport(CommonCrypto)
+// Darwin only: PBKDF2 is the single most expensive step of the whole type-33 connect — the server
+// asks for ~142,857 HMAC-SHA512 iterations at dkLen=128 (2 output blocks ⇒ ~571k SHA-512
+// compressions). Pure-Swift CryptoSwift needs ~37s of that at `-Onone` (measured, M3 Max), which was
+// the bulk of the ~30s HP connect; CommonCrypto's `CCKeyDerivationPBKDF` does it in ~0.10s in BOTH
+// Debug and Release. Same reasoning (and same non-dependency: CommonCrypto ships with the OS) as the
+// SRTP hot path in `Encryption/AppleSRTPDecryptor.swift`. Output is byte-identical — PBKDF2 is a
+// standard, and `AppleSRPClientTests` asserts the two implementations agree.
+import CommonCrypto
+#endif
+
 /// Pure (Foundation-only, no socket) SRP-6a math for Apple Remote Desktop auth type 33.
 ///
 /// Implements the non-standard Apple SRP-6a variant exactly as documented in
@@ -58,6 +69,9 @@ enum AppleSRPClient {
     ///   - g: The generator `g` (Apple uses `5`).
     ///   - B: The server public value `B` (512 bytes big-endian).
     ///   - a: The client private exponent `a`, injected for determinism (>= 256 bits in production).
+    ///   - onPhase: Optional observer called once per CPU-heavy phase with `(phase, seconds)` —
+    ///     `"pbkdf2"` then `"modexp"`. Timings only; never receives key material. Default `nil` so the
+    ///     derivation is unchanged when no caller observes it.
     /// - Returns: `A` (client public value, PAD-ed to 512B — the value hashed and, per the dossier,
     ///   sent on the wire), `M1` (client proof, 64B), `K` (session key, 64B), `S` (shared secret,
     ///   minimal big-endian), `x` (private key, 64B) and `u` (scrambling parameter, 64B). `S`/`x`/`u`
@@ -68,18 +82,19 @@ enum AppleSRPClient {
                        N: Data,
                        g: Data,
                        B: Data,
-                       a: Data) throws -> (A: Data, M1: Data, K: Data, S: Data, x: Data, u: Data) {
+                       a: Data,
+                       onPhase: ((String, Double) -> Void)? = nil) throws -> (A: Data, M1: Data, K: Data, S: Data, x: Data, u: Data) {
         // P' = PBKDF2-HMAC-SHA512(password, salt, iterations, dkLen=128)
-        let pPrime: [UInt8]
-        do {
-            pPrime = try PKCS5.PBKDF2(password: Array(password),
-                                      salt: Array(salt),
+        let pbkdf2Start = Date()
+        let pPrime = try pbkdf2SHA512(password: password,
+                                      salt: salt,
                                       iterations: iterations,
-                                      keyLength: 128,
-                                      variant: .sha2(.sha512)).calculate()
-        } catch {
-            throw VNCError.authentication(.ardAuthenticationFailed)
-        }
+                                      keyLength: 128)
+        onPhase?("pbkdf2", -pbkdf2Start.timeIntervalSinceNow)
+
+        // Everything below is hashing + the three 4096-bit modular exponentiations (`A`, `g^x`, `S`);
+        // nothing here throws, so the phase is closed just before `return`.
+        let modexpStart = Date()
 
         // x = SHA512(salt || SHA512(0x3a || P'))  — ':' separator, empty username.
         let xInner = sha512(Data([0x3a]) + Data(pPrime))
@@ -131,8 +146,93 @@ enum AppleSRPClient {
         m1Input.append(kSession)
         let m1 = sha512(m1Input)
 
+        onPhase?("modexp", -modexpStart.timeIntervalSinceNow)
+
         return (A: aData, M1: m1, K: kSession, S: sData, x: xData, u: uData)
     }
+
+    // MARK: - PBKDF2
+
+    /// `PBKDF2-HMAC-SHA512(password, salt, iterations, dkLen: keyLength)`.
+    ///
+    /// Routed to CommonCrypto on Apple platforms (see the `import CommonCrypto` note above): the wire
+    /// iteration count is ~142,857, which pure-Swift CryptoSwift turns into tens of seconds of connect
+    /// latency in a Debug (`-Onone`) build. PBKDF2 is a standard, so both paths produce identical
+    /// bytes — `AppleSRPClientTests.testPBKDF2ImplementationsAgree` pins that.
+    ///
+    /// Empty password/salt fall back to the CryptoSwift path: `CCKeyDerivationPBKDF` would receive a
+    /// nil base address for a zero-length buffer, which is not a documented-safe call. That keeps both
+    /// degenerate inputs behaving exactly as they did before this split — an empty password derives, an
+    /// empty salt throws (CryptoSwift's own `PBKDF2.init` guard). A real s2c1 salt is 32 bytes.
+    static func pbkdf2SHA512(password: Data,
+                             salt: Data,
+                             iterations: Int,
+                             keyLength: Int) throws -> [UInt8] {
+#if canImport(CommonCrypto)
+        if !password.isEmpty, !salt.isEmpty {
+            return try pbkdf2SHA512CommonCrypto(password: password,
+                                                salt: salt,
+                                                iterations: iterations,
+                                                keyLength: keyLength)
+        }
+#endif
+
+        return try pbkdf2SHA512CryptoSwift(password: password,
+                                           salt: salt,
+                                           iterations: iterations,
+                                           keyLength: keyLength)
+    }
+
+    /// Portable pure-Swift PBKDF2 (CryptoSwift). Retained as the non-Darwin path and as the test
+    /// oracle the CommonCrypto path is diffed against.
+    static func pbkdf2SHA512CryptoSwift(password: Data,
+                                        salt: Data,
+                                        iterations: Int,
+                                        keyLength: Int) throws -> [UInt8] {
+        do {
+            return try PKCS5.PBKDF2(password: Array(password),
+                                    salt: Array(salt),
+                                    iterations: iterations,
+                                    keyLength: keyLength,
+                                    variant: .sha2(.sha512)).calculate()
+        } catch {
+            throw VNCError.authentication(.ardAuthenticationFailed)
+        }
+    }
+
+#if canImport(CommonCrypto)
+    /// Hardware-path PBKDF2 via `CCKeyDerivationPBKDF`. Requires non-empty password and salt.
+    static func pbkdf2SHA512CommonCrypto(password: Data,
+                                         salt: Data,
+                                         iterations: Int,
+                                         keyLength: Int) throws -> [UInt8] {
+        guard iterations > 0, keyLength > 0, !password.isEmpty, !salt.isEmpty else {
+            throw VNCError.authentication(.ardAuthenticationFailed)
+        }
+
+        var derived = [UInt8](repeating: 0, count: keyLength)
+
+        let status = password.withUnsafeBytes { passwordBytes -> Int32 in
+            salt.withUnsafeBytes { saltBytes -> Int32 in
+                CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2),
+                                     passwordBytes.baseAddress!.assumingMemoryBound(to: CChar.self),
+                                     password.count,
+                                     saltBytes.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                                     salt.count,
+                                     CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA512),
+                                     UInt32(iterations),
+                                     &derived,
+                                     keyLength)
+            }
+        }
+
+        guard status == kCCSuccess else {
+            throw VNCError.authentication(.ardAuthenticationFailed)
+        }
+
+        return derived
+    }
+#endif
 
     // MARK: - Server proof (M2)
 

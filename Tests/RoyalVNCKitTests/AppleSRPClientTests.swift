@@ -197,4 +197,114 @@ final class AppleSRPClientTests: XCTestCase {
 
         // Purpose: prove 4096-bit BigUInteger modexp path works without overflow/crash (de-risks R8).
     }
+
+    // MARK: - PBKDF2 implementation equivalence (connect-latency fix)
+
+    /// `derive` routes PBKDF2 to CommonCrypto on Apple platforms because the wire iteration count
+    /// (~142,857) costs tens of seconds through pure-Swift CryptoSwift in a `-Onone` build. PBKDF2 is a
+    /// standard, so the two implementations MUST agree byte-for-byte — if they ever diverge, `x` (and
+    /// therefore `M1`) changes and auth fails on the wire with no local symptom. This is the pin.
+    ///
+    /// (The known-answer tests above are the other half of the proof: they compare `derive`'s output —
+    /// now produced via CommonCrypto on this platform — against the independent Python oracle.)
+    func testPBKDF2ImplementationsAgree() throws {
+        let cases: [(password: String, salt: [UInt8], iterations: Int, keyLength: Int)] = [
+            ("hunter2-correct-horse", Array(Hex.data(saltHex)), 211, 128),   // the oracle case
+            ("hunter2-correct-horse", Array(Hex.data(saltHex)), 307, 128),   // second iteration count
+            ("p", [0x00], 1, 128),                                           // minimal inputs, dkLen > 1 block
+            ("padded\u{0000}password", Array(repeating: 0xFF, count: 32), 37, 64),  // NUL inside the password, 1 block
+            ("unicode-ünïcødé-🔑", Array(repeating: 0x5A, count: 16), 53, 200)      // multi-byte UTF-8, non-block-multiple dkLen
+        ]
+
+        for testCase in cases {
+            let password = Data(testCase.password.utf8)
+            let salt = Data(testCase.salt)
+
+            let swiftOutput = try AppleSRPClient.pbkdf2SHA512CryptoSwift(password: password,
+                                                                         salt: salt,
+                                                                         iterations: testCase.iterations,
+                                                                         keyLength: testCase.keyLength)
+            let dispatched = try AppleSRPClient.pbkdf2SHA512(password: password,
+                                                             salt: salt,
+                                                             iterations: testCase.iterations,
+                                                             keyLength: testCase.keyLength)
+
+            XCTAssertEqual(swiftOutput.count, testCase.keyLength,
+                           "dkLen must be honoured (\(testCase.password), \(testCase.iterations))")
+            XCTAssertEqual(dispatched, swiftOutput,
+                           "the dispatched PBKDF2 must match CryptoSwift byte-for-byte (\(testCase.password), iters=\(testCase.iterations), dkLen=\(testCase.keyLength))")
+
+#if canImport(CommonCrypto)
+            let commonCrypto = try AppleSRPClient.pbkdf2SHA512CommonCrypto(password: password,
+                                                                           salt: salt,
+                                                                           iterations: testCase.iterations,
+                                                                           keyLength: testCase.keyLength)
+            XCTAssertEqual(commonCrypto, swiftOutput,
+                           "CommonCrypto PBKDF2 must match CryptoSwift byte-for-byte (\(testCase.password), iters=\(testCase.iterations), dkLen=\(testCase.keyLength))")
+#endif
+        }
+    }
+
+    /// Empty password or salt must not reach `CCKeyDerivationPBKDF` (a zero-length buffer yields a nil
+    /// base address, which is not a documented-safe call) — the dispatcher falls back to CryptoSwift, so
+    /// those two inputs keep exactly the behaviour they had before the CommonCrypto path existed:
+    /// an empty password derives normally, an empty salt is rejected (CryptoSwift `PBKDF2.init` guard).
+    func testPBKDF2EmptyInputsFallBackToCryptoSwift() throws {
+        let salt = Data(Hex.data(saltHex))
+
+        let emptyPassword = try AppleSRPClient.pbkdf2SHA512(password: Data(), salt: salt,
+                                                            iterations: 11, keyLength: 128)
+        XCTAssertEqual(emptyPassword,
+                       try AppleSRPClient.pbkdf2SHA512CryptoSwift(password: Data(), salt: salt,
+                                                                  iterations: 11, keyLength: 128),
+                       "an empty password must still derive via the CryptoSwift fallback")
+
+        // An empty salt is rejected by both paths — unchanged pre-existing behaviour, not a regression
+        // introduced by the fallback (a real s2c1 challenge always carries a 32-byte salt).
+        XCTAssertThrowsError(try AppleSRPClient.pbkdf2SHA512(password: Data("pw".utf8), salt: Data(),
+                                                             iterations: 11, keyLength: 128))
+        XCTAssertThrowsError(try AppleSRPClient.pbkdf2SHA512CryptoSwift(password: Data("pw".utf8), salt: Data(),
+                                                                       iterations: 11, keyLength: 128))
+
+#if canImport(CommonCrypto)
+        // The CommonCrypto seam itself rejects the degenerate inputs rather than calling with a nil pointer.
+        XCTAssertThrowsError(try AppleSRPClient.pbkdf2SHA512CommonCrypto(password: Data(), salt: salt,
+                                                                         iterations: 11, keyLength: 128))
+        XCTAssertThrowsError(try AppleSRPClient.pbkdf2SHA512CommonCrypto(password: Data("pw".utf8), salt: Data(),
+                                                                         iterations: 11, keyLength: 128))
+        XCTAssertThrowsError(try AppleSRPClient.pbkdf2SHA512CommonCrypto(password: Data("pw".utf8), salt: salt,
+                                                                         iterations: 0, keyLength: 128))
+        XCTAssertThrowsError(try AppleSRPClient.pbkdf2SHA512CommonCrypto(password: Data("pw".utf8), salt: salt,
+                                                                         iterations: 11, keyLength: 0))
+#endif
+    }
+
+    // MARK: - Phase timings (connect diagnostics)
+
+    /// `derive` reports one `pbkdf2` phase then one `modexp` phase, so the coordinator can log where a
+    /// slow HP connect went. Durations are non-negative; no key material crosses the callback.
+    func testDeriveReportsPhaseTimingsInOrder() throws {
+        let i = makeInputs()
+        var phases: [(String, Double)] = []
+
+        _ = try AppleSRPClient.derive(password: i.password, salt: i.salt, iterations: 211,
+                                      N: i.N, g: i.g, B: i.B, a: i.a,
+                                      onPhase: { phase, seconds in phases.append((phase, seconds)) })
+
+        XCTAssertEqual(phases.map(\.0), ["pbkdf2", "modexp"], "both phases report, in order")
+        XCTAssertTrue(phases.allSatisfy { $0.1 >= 0 }, "durations must be non-negative")
+    }
+
+    /// The default `onPhase == nil` path must behave identically (no observer, same bytes).
+    func testDeriveWithoutPhaseObserverMatches() throws {
+        let i = makeInputs()
+        let observed = try AppleSRPClient.derive(password: i.password, salt: i.salt, iterations: 211,
+                                                 N: i.N, g: i.g, B: i.B, a: i.a,
+                                                 onPhase: { _, _ in })
+        let unobserved = try AppleSRPClient.derive(password: i.password, salt: i.salt, iterations: 211,
+                                                   N: i.N, g: i.g, B: i.B, a: i.a)
+
+        XCTAssertEqual(observed.M1, unobserved.M1)
+        XCTAssertEqual(observed.K, unobserved.K)
+    }
 }

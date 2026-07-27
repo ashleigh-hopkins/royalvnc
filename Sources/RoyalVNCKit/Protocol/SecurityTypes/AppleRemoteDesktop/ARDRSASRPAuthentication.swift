@@ -108,14 +108,24 @@ extension VNCProtocol {
             logger.logDebug("[ard33] s2c1: N=\(challenge.N.count)B g=\(challenge.g.map { String(format: "%02x", $0) }.joined()) salt=\(challenge.salt.count)B B=\(challenge.B.count)B iters=\(challenge.iterations) opts=\(challenge.options.count)B")
 
             // Step 3 — solve SRP. `a` is a fresh ≥256-bit private exponent (A3).
+            //
+            // This is the connect path's CPU floor: PBKDF2 at the server's iteration count plus three
+            // 4096-bit modular exponentiations. The per-phase timing is logged (durations only, never
+            // key material) because it is the first thing to look at whenever HP connect feels slow —
+            // both terms are pure compute and inflate ~10-40x in a Debug (`-Onone`) build.
             let a = try randomBytes(32)
+            let deriveStart = Date()
             let srp = try AppleSRPClient.derive(password: Data(credential.password.utf8),
                                                 salt: challenge.salt,
                                                 iterations: challenge.iterations,
                                                 N: challenge.N,
                                                 g: challenge.g,
                                                 B: challenge.B,
-                                                a: a)
+                                                a: a,
+                                                onPhase: { phase, seconds in
+                                                    logger.logDebug("[ard33] srp \(phase): \(Self.milliseconds(seconds))ms")
+                                                })
+            logger.logDebug("[ard33] srp derive total: \(Self.milliseconds(-deriveStart.timeIntervalSinceNow))ms (iters=\(challenge.iterations))")
 
             let clientRandom = try randomBytes(16)
             // ORACLE(O5): the `opts` echoed in c2s2 (here: the server's s2c1 options verbatim).
@@ -302,6 +312,14 @@ extension VNCProtocol.ARDRSASRPAuthentication {
 #else
         return Data((0..<count).map { _ in UInt8.random(in: 0...255) })
 #endif
+    }
+}
+
+// MARK: - Logging helpers
+private extension VNCProtocol.ARDRSASRPAuthentication {
+    /// Whole milliseconds, for the connect-timing log lines.
+    static func milliseconds(_ seconds: Double) -> Int {
+        Int((seconds * 1000).rounded())
     }
 }
 
