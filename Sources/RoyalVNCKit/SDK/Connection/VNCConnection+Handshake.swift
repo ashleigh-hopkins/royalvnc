@@ -446,6 +446,10 @@ private extension VNCConnection {
 			0x00,0x00,0x04,0x51, 0x00,0x00,0x04,0x53, 0x00,0x00,0x04,0x55,
 			0x00,0x00,0x04,0x56
 		]
+		// TIMED (see the [hp-media] negotiation timings): stage durations for the whole HP bring-up, so a
+		// slow connect can be attributed from a device log instead of guessed at.
+		let bringUpStart = Date()
+
 		do {
 			try await connection.write(data: Data(viewerInfoPlus12))
 			try await Task.sleep(nanoseconds: 100_000_000)   // _POST_VIEWERINFO_SETTLE_S = 0.1s
@@ -476,12 +480,17 @@ private extension VNCConnection {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send HP Prelude",
 																 underlyingError: error)
 		}
-		logger.logDebug("[hp] sent plaintext prelude (ViewerInfo+0x12, SetEncodings)")
+		logger.logDebug("[hp] sent plaintext prelude (ViewerInfo+0x12, SetEncodings) in \(Self.hpElapsedMs(since: bringUpStart))ms")
 
 		// § crib 3 — the 36-byte 1103 rekey arrives as a rect inside a plaintext FramebufferUpdate (0x00).
+		// TIMED: this read blocks until the daemon sends the rekey burst. When a `0x1d` virtual display was
+		// just requested, the host is creating that display first — so if a virtual-display connect is slow
+		// before media negotiation even starts, it shows up here rather than in the [hp-media] retry loop.
+		let rekeyStart = Date()
 		let rekeyBody: Data
 		do {
 			rekeyBody = try await readAppleRekeyBlob()
+			logger.logDebug("[hp] 1103 rekey read in \(Self.hpElapsedMs(since: rekeyStart))ms")
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Read 1103 Rekey",
 																 underlyingError: error)
@@ -530,6 +539,8 @@ private extension VNCConnection {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "HP media offer",
 																 underlyingError: error)
 		}
+
+		logger.logDebug("[hp] bring-up total: \(Self.hpElapsedMs(since: bringUpStart))ms (prelude → rekey → arm → media canvas)")
 	}
 
 	/// Read the 36-byte `1103` rekey blob, which Apple delivers as a rect inside a plaintext

@@ -98,6 +98,21 @@ final class AppleHighPerformanceGatingTests: XCTestCase {
         return data
     }
 
+    // MARK: - Connect-stage timing helper
+
+    /// `hpElapsedMs` backs every `[hp]`/`[hp-media]` connect-stage duration. It must report elapsed
+    /// milliseconds and must NEVER print a negative number: it reads wall-clock `Date`, so a clock
+    /// adjustment (or NTP step) mid-connect can put `start` in the future.
+    func testHPElapsedMsMeasuresForwardAndClampsAtZero() {
+        let quarterSecondAgo = Date().addingTimeInterval(-0.25)
+        let measured = VNCConnection.hpElapsedMs(since: quarterSecondAgo)
+        XCTAssertGreaterThanOrEqual(measured, 200, "≈250ms must be reported as roughly 250ms")
+        XCTAssertLessThan(measured, 2000, "a 250ms interval must not report seconds")
+
+        XCTAssertEqual(VNCConnection.hpElapsedMs(since: Date().addingTimeInterval(5)), 0,
+                       "a start time in the future (clock step) must clamp to 0, never go negative")
+    }
+
     private static func makeSettings(enableHighPerformance: Bool) -> VNCConnection.Settings {
         VNCConnection.Settings(isDebugLoggingEnabled: false,
                                hostname: "localhost",

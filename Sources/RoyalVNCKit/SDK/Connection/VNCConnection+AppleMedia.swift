@@ -84,17 +84,29 @@ extension VNCConnection {
         try await connection.write(data: Data([0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff]))
 
         // Read + parse the answer canvas, with the degenerate-retry loop (crib §2b).
+        //
+        // TIMED: this loop is the main suspect whenever an HP connect (especially one that asked for a
+        // `0x1d` virtual display) feels slow — the host has to create the display before it can answer with
+        // a usable canvas, so the early answers come back degenerate and we spin here. Each iteration costs
+        // a 0.2s sleep plus however long the answer read blocks, up to 16 times, and if it never converges
+        // the connection is failed on purpose (see the fail-fast below) and the caller reconnects without
+        // the request — i.e. the whole handshake is paid twice. Per-attempt + total timings distinguish
+        // "slow but converged" from "exhausted and retried", which need different fixes.
+        let negotiationStart = Date()
         var canvas = try await readMediaAnswer()
+        logger.logDebug("[hp-media] first answer read in \(Self.hpElapsedMs(since: negotiationStart))ms (ready=\(canvas.isReady))")
         var attempts = 0
         while !canvas.isReady, attempts < 16 {
             attempts += 1
+            let attemptStart = Date()
             logger.logDebug("[hp-media] degenerate canvas, re-sending 0x1c (attempt \(attempts))")
             try await connection.write(data: offer)
             try await Task.sleep(nanoseconds: 200_000_000)   // _DEGENERATE_RETRY_INTERVAL_S = 0.2s
             canvas = try await readMediaAnswer()
+            logger.logDebug("[hp-media] attempt \(attempts) took \(Self.hpElapsedMs(since: attemptStart))ms (ready=\(canvas.isReady), \(Self.hpElapsedMs(since: negotiationStart))ms cumulative)")
         }
 
-        logger.logDebug("[hp-media] answer canvas \(canvas.width)x\(canvas.height) tiles=\(canvas.tileCount) ltrp=\(canvas.ltrpEnabled) ready=\(canvas.isReady)")
+        logger.logDebug("[hp-media] answer canvas \(canvas.width)x\(canvas.height) tiles=\(canvas.tileCount) ltrp=\(canvas.ltrpEnabled) ready=\(canvas.isReady) — negotiated in \(Self.hpElapsedMs(since: negotiationStart))ms after \(attempts) retries")
 
         // Geometry note: the canvas can legitimately differ from ServerInit (which describes the host's
         // PHYSICAL display and was read before this negotiation). The framebuffer is created AFTER this call
@@ -151,7 +163,7 @@ extension VNCConnection {
         // for one connect). Only applies when WE asked for the virtual display; the plain HP path is
         // unchanged (a degenerate canvas there is the pre-existing, non-curtaining behaviour).
         if !canvas.isReady, settings.highPerformanceDisplay != nil {
-            logger.logError("[hp-vdisp] virtual display was requested but the host never returned a usable canvas after \(attempts) retries — failing the connection so the curtain lifts instead of leaving a blank, curtained host")
+            logger.logError("[hp-vdisp] virtual display was requested but the host never returned a usable canvas after \(attempts) retries / \(Self.hpElapsedMs(since: negotiationStart))ms — failing the connection so the curtain lifts instead of leaving a blank, curtained host (the caller's next connect omits the request, so this whole handshake is about to be paid again)")
             throw VNCError.protocol(.invalidData)
         }
     }
@@ -177,6 +189,12 @@ extension VNCConnection {
 
     private static func nowNanos() -> UInt64 {
         UInt64(Date().timeIntervalSince1970 * 1_000_000_000)
+    }
+
+    /// Whole milliseconds elapsed since `start`, for the HP connect-stage timing logs. Clamped at 0 —
+    /// `Date` is wall-clock, so a clock adjustment mid-connect must not print a negative duration.
+    static func hpElapsedMs(since start: Date) -> Int {
+        max(0, Int((-start.timeIntervalSinceNow * 1000).rounded()))
     }
 }
 
