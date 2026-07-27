@@ -17,9 +17,14 @@ public extension VNCConnection.Settings {
 		/// Backing pixels the encoder is asked to produce (and we must decode) — the cost-determining number.
 		public let pixelWidth: Int
 		public let pixelHeight: Int
-		/// Backing:point ratio advertised in the mode table. `1` = flat (backing == points) — the low-decode
-		/// choice, and the default here. `2` = Retina (backing = 2× points), which QUADRUPLES decode cost.
-		public let hidpiScale: Int
+		/// Logical (point) size that goes on the `0x1d` wire. STORED rather than derived, because the
+		/// backing:point ratio is not required to be an integer: the mode table carries `pixelWidth/Height`
+		/// and `pointWidth/Height` as independent u32 fields, so 1.5 (e.g. 2868 px over 1912 pt) is
+		/// expressible. That matters on a phone — 2× Retina rendering fixes text quality but halves the
+		/// desktop area in each axis, which makes windows and text feel oversized; 1.5 keeps most of the
+		/// quality win with a third more usable area at the SAME decode cost.
+		public let logicalWidth: Int
+		public let logicalHeight: Int
 
 		/// The daemon caps a virtual display at 3840×2160 backing; a larger request hits a server-side
 		/// "safe minimum" fallback (i.e. a degenerate canvas), so requests are clamped to the cap instead.
@@ -29,23 +34,30 @@ public extension VNCConnection.Settings {
 		/// - Parameters:
 		///   - pixelWidth: desired backing width in pixels (clamped to `maxPixelWidth`, min 2).
 		///   - pixelHeight: desired backing height in pixels (clamped to `maxPixelHeight`, min 2).
-		///   - hidpiScale: backing:point ratio; `1` (default) keeps decode cost at the pixel count stated.
+		///   - hidpiScale: backing:point ratio. `1` = flat (backing == points). Values above 1 ask the host to
+		///     render Retina-style: the decode cost is unchanged (it is fixed by the PIXEL dims) while the
+		///     logical desktop shrinks by the scale. Fractional values are allowed — see `logicalWidth`.
 		///
 		/// Dimensions are forced EVEN: HEVC chroma/CTU alignment and the 4-way tile split both behave badly on
-		/// odd sizes, and the daemon would round anyway.
-		public init(pixelWidth: Int, pixelHeight: Int, hidpiScale: Int = 1) {
-			let scale = max(1, hidpiScale)
+		/// odd sizes, and the daemon would round anyway. The derived point dims are forced even for the same
+		/// reason (a 1.5 scale on an odd point count would otherwise produce a fractional backing).
+		public init(pixelWidth: Int, pixelHeight: Int, hidpiScale: Double = 1) {
+			let scale = max(1.0, hidpiScale)
 			let w = min(max(2, pixelWidth), Self.maxPixelWidth)
 			let h = min(max(2, pixelHeight), Self.maxPixelHeight)
-			self.pixelWidth = w - (w % 2)
-			self.pixelHeight = h - (h % 2)
-			self.hidpiScale = scale
+			let evenW = w - (w % 2)
+			let evenH = h - (h % 2)
+			self.pixelWidth = evenW
+			self.pixelHeight = evenH
+
+			let pointW = max(2, Int((Double(evenW) / scale).rounded()))
+			let pointH = max(2, Int((Double(evenH) / scale).rounded()))
+			self.logicalWidth = pointW - (pointW % 2)
+			self.logicalHeight = pointH - (pointH % 2)
 		}
 
-		/// Logical (point) width that goes on the `0x1d` wire.
-		public var logicalWidth: Int { max(1, pixelWidth / hidpiScale) }
-		/// Logical (point) height that goes on the `0x1d` wire.
-		public var logicalHeight: Int { max(1, pixelHeight / hidpiScale) }
+		/// The realised backing:point ratio (may differ from the requested scale by the even-rounding above).
+		public var hidpiScale: Double { Double(pixelWidth) / Double(max(1, logicalWidth)) }
 
 		/// Total backing pixels — the decode-cost proxy. 5120×1440 = 7.37 M saturates an A18 at 4:4:4.
 		public var backingPixelCount: Int { pixelWidth * pixelHeight }

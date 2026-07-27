@@ -194,4 +194,79 @@ final class Apple0x1dSetDisplayConfigurationTests: XCTestCase {
 		let o = 12 + 0x9C + 28 * index + 0x18
 		return UInt32(b[o]) << 24 | UInt32(b[o + 1]) << 16 | UInt32(b[o + 2]) << 8 | UInt32(b[o + 3])
 	}
+
+	// MARK: - Fractional backing:point ratio (explicit pixel+point form)
+
+	/// The wire carries pixel and point dims as INDEPENDENT u32s per mode, so the ratio need not be an
+	/// integer. 1.5 is the useful phone setting: 2× Retina fixes text quality but halves the desktop area in
+	/// each axis (oversized windows/text), while 1.5 keeps most of the quality at the SAME decode cost.
+	func testExplicitPixelAndPointDimsSupportA1Point5Ratio() {
+		let d = Apple0x1dSetDisplayConfiguration.build(logicalWidth: 1912, logicalHeight: 880,
+													  pixelWidth: 2868, pixelHeight: 1320,
+													  displayName: Self.name)
+		XCTAssertEqual(d.count, 308, "the message layout is unchanged by a fractional ratio")
+
+		let m0 = Self.mode(d, 0)
+		XCTAssertEqual(m0.pointWidth, 1912)
+		XCTAssertEqual(m0.pointHeight, 880)
+		XCTAssertEqual(m0.pixelWidth, 2868, "the requested BACKING must appear verbatim — no rounding")
+		XCTAssertEqual(m0.pixelHeight, 1320, "the requested BACKING must appear verbatim — no rounding")
+	}
+
+	/// Mode 0 is the request; the remaining template modes must carry the same ratio (not a re-derived
+	/// integer one), otherwise the host could pick a sibling mode with a different backing than we budgeted.
+	func testTemplateModesInheritTheFractionalRatio() {
+		let d = Apple0x1dSetDisplayConfiguration.build(logicalWidth: 1912, logicalHeight: 880,
+													  pixelWidth: 2868, pixelHeight: 1320,
+													  displayName: Self.name)
+		for index in 1..<5 {
+			let m = Self.mode(d, index)
+			guard m.pointWidth > 0, m.pointHeight > 0 else { continue }
+			XCTAssertEqual(Double(m.pixelWidth) / Double(m.pointWidth), 1.5, accuracy: 0.01,
+						   "mode \(index) width ratio")
+			XCTAssertEqual(Double(m.pixelHeight) / Double(m.pointHeight), 1.5, accuracy: 0.01,
+						   "mode \(index) height ratio")
+		}
+	}
+
+	/// The integer-scale entry point is now a wrapper over the explicit form. It must still produce the
+	/// reference bytes — the golden vectors above are the real guard, this pins the equivalence directly.
+	func testIntegerScaleWrapperMatchesTheExplicitForm() {
+		let viaScale = Apple0x1dSetDisplayConfiguration.build(logicalWidth: 1920, logicalHeight: 1080,
+															 hidpiScale: 2, displayName: Self.name)
+		let viaExplicit = Apple0x1dSetDisplayConfiguration.build(logicalWidth: 1920, logicalHeight: 1080,
+																pixelWidth: 3840, pixelHeight: 2160,
+																displayName: Self.name)
+		XCTAssertEqual(viaScale, viaExplicit)
+	}
+
+	// MARK: - HighPerformanceDisplay point derivation
+
+	/// The settings value type derives (and stores) the point size from the backing budget and the scale.
+	/// A 1.5 scale must keep the backing exactly as requested — that number is the decode cost the user
+	/// chose — and land the points on an even number.
+	func testHighPerformanceDisplayDerivesEvenPointsAtA1Point5Scale() {
+		let display = VNCConnection.Settings.HighPerformanceDisplay(pixelWidth: 2868,
+																	pixelHeight: 1320,
+																	hidpiScale: 1.5)
+		XCTAssertEqual(display.pixelWidth, 2868, "backing is the budget and must not move")
+		XCTAssertEqual(display.pixelHeight, 1320)
+		XCTAssertEqual(display.logicalWidth, 1912, "2868 / 1.5 = 1912")
+		XCTAssertEqual(display.logicalHeight, 880, "1320 / 1.5 = 880")
+		XCTAssertEqual(display.logicalWidth % 2, 0)
+		XCTAssertEqual(display.logicalHeight % 2, 0)
+		XCTAssertEqual(display.hidpiScale, 1.5, accuracy: 0.01)
+	}
+
+	/// Flat (1×) and Retina (2×) must keep behaving exactly as before the type gained fractional support.
+	func testHighPerformanceDisplayFlatAndRetinaUnchanged() {
+		let flat = VNCConnection.Settings.HighPerformanceDisplay(pixelWidth: 1920, pixelHeight: 1080)
+		XCTAssertEqual(flat.logicalWidth, 1920)
+		XCTAssertEqual(flat.logicalHeight, 1080)
+
+		let retina = VNCConnection.Settings.HighPerformanceDisplay(pixelWidth: 1920, pixelHeight: 1080,
+																   hidpiScale: 2)
+		XCTAssertEqual(retina.logicalWidth, 960)
+		XCTAssertEqual(retina.logicalHeight, 540)
+	}
 }

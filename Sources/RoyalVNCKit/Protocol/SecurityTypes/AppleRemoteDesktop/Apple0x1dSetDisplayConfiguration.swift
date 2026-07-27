@@ -106,16 +106,50 @@ enum Apple0x1dSetDisplayConfiguration {
 					  displayName: String = defaultDisplayName,
 					  modeCount: Int = 5) -> Data {
 		let scale = max(1, hidpiScale)
+
+		return build(logicalWidth: logicalWidth,
+					 logicalHeight: logicalHeight,
+					 pixelWidth: logicalWidth * scale,
+					 pixelHeight: logicalHeight * scale,
+					 hdr: hdr,
+					 displayName: displayName,
+					 modeCount: modeCount)
+	}
+
+	/// Build the `0x1d` message from an explicit POINT size and BACKING size.
+	///
+	/// This is the canonical form: the wire carries the two independently (per mode entry), so the
+	/// backing:point ratio need not be an integer. 1.5 — e.g. 2868×1320 backing over 1912×880 points — is the
+	/// useful middle setting on a phone: 2× Retina fixes text quality but halves the desktop area in each
+	/// axis (windows and text end up oversized), while 1.5 keeps most of the quality at the same decode cost.
+	/// Mode 0 carries BOTH requested sizes verbatim, so no rounding can move the backing the caller budgeted
+	/// for; the remaining template modes are scaled by the same ratio.
+	static func build(logicalWidth: Int,
+					  logicalHeight: Int,
+					  pixelWidth: Int,
+					  pixelHeight: Int,
+					  hdr: Bool = false,
+					  displayName: String = defaultDisplayName,
+					  modeCount: Int = 5) -> Data {
 		let modes = min(max(1, modeCount), modeTemplatePoints.count)
 
-		// Scale Apple's template to the target. Entry 0 reproduces the request exactly.
+		// Ratio implied by the request; applied to the template modes (entry 0 is exact, see below).
+		let ratioX = Double(pixelWidth) / Double(max(1, logicalWidth))
+		let ratioY = Double(pixelHeight) / Double(max(1, logicalHeight))
+
+		// Scale Apple's template to the target. Entry 0 reproduces the request exactly — both sizes verbatim,
+		// so a fractional ratio cannot round the requested backing off its budget.
 		let sx = Double(logicalWidth) / 1920.0
 		let sy = Double(logicalHeight) / 1080.0
 		let modeEntries: [(pw: UInt32, ph: UInt32, ptw: UInt32, pth: UInt32)] = (0..<modes).map { i in
+			if i == 0 {
+				return (pw: UInt32(max(0, pixelWidth)), ph: UInt32(max(0, pixelHeight)),
+						ptw: UInt32(max(0, logicalWidth)), pth: UInt32(max(0, logicalHeight)))
+			}
 			let t = modeTemplatePoints[i]
 			let ptw = Int((Double(t.w) * sx) + 0.5)
 			let pth = Int((Double(t.h) * sy) + 0.5)
-			return (pw: UInt32(ptw * scale), ph: UInt32(pth * scale),
+			return (pw: UInt32((Double(ptw) * ratioX).rounded()), ph: UInt32((Double(pth) * ratioY).rounded()),
 					ptw: UInt32(ptw), pth: UInt32(pth))
 		}
 

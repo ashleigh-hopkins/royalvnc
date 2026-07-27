@@ -470,7 +470,8 @@ private extension VNCConnection {
 			if let display = settings.highPerformanceDisplay {
 				let sdc = Apple0x1dSetDisplayConfiguration.build(logicalWidth: display.logicalWidth,
 																 logicalHeight: display.logicalHeight,
-																 hidpiScale: display.hidpiScale)
+																 pixelWidth: display.pixelWidth,
+																 pixelHeight: display.pixelHeight)
 				try await connection.write(data: sdc)
 				logger.logDebug("[hp-vdisp] sent 0x1d SetDisplayConfiguration (\(sdc.count) B) backing=\(display.pixelWidth)x\(display.pixelHeight) points=\(display.logicalWidth)x\(display.logicalHeight) hidpi=\(display.hidpiScale) — HOST IS NOW CURTAINED")
 			}
