@@ -85,6 +85,21 @@ public extension VNCConnection {
 		/// `003.889` or type-33-over-TLS). Connect-time only.
 		public let enableHighPerformance: Bool
 
+		/// Requested Apple-HP **virtual-display** geometry, sent as the `0x1d` SetDisplayConfiguration during
+		/// the HP plaintext prelude. `nil` (the default) sends nothing: byte-for-byte today's behaviour, where
+		/// the daemon streams the host's PHYSICAL display and the host screen keeps mirroring the session.
+		///
+		/// Non-nil asks `screensharingd` to create a SkyLight virtual display of that size and encode it
+		/// instead — the mechanism Apple's own client uses so it never has to decode a huge panel. This is the
+		/// lever for decode cost: on an A18 a 5120×1440 4:4:4 stream saturates the HW decoder (~4 ms/AU) and
+		/// slips into unbounded slow-motion, while ~1920×1080 has ample headroom.
+		///
+		/// ⚠️ Setting this **curtains the host**: the Mac's physical screen stops showing the desktop for the
+		/// session, and creating a differently-shaped display reflows the user's windows (persisting after
+		/// disconnect). Therefore it must remain explicitly opt-in, never a silent default. Ignored unless
+		/// `enableHighPerformance` is `true`. Connect-time only.
+		public let highPerformanceDisplay: HighPerformanceDisplay?
+
 #if canImport(ObjectiveC)
 		@objc(frameEncodings)
 #endif
@@ -106,7 +121,8 @@ public extension VNCConnection {
 					compressionLevel: CompressionLevel = .default,
 					useContinuousUpdates: Bool = false,
 					useOptimisticContinuousUpdates: Bool = false,
-					enableHighPerformance: Bool = false) {
+					enableHighPerformance: Bool = false,
+					highPerformanceDisplay: HighPerformanceDisplay? = nil) {
 			self.isDebugLoggingEnabled = isDebugLoggingEnabled
 
 			self.hostname = hostname
@@ -129,6 +145,7 @@ public extension VNCConnection {
 			self.useContinuousUpdates = useContinuousUpdates
 			self.useOptimisticContinuousUpdates = useOptimisticContinuousUpdates
 			self.enableHighPerformance = enableHighPerformance
+			self.highPerformanceDisplay = highPerformanceDisplay
 		}
 
 #if canImport(ObjectiveC)

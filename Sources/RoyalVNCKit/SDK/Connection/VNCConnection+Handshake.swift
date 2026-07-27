@@ -416,8 +416,9 @@ private extension VNCConnection {
 			0x00,0x00,
 			0x12,0x00,0x00,0x01,0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x01
 		]
-		// SetEncodings (0x02, 56B): count=13, HP_ENCODINGS_FULL. Skip SetDisplayConfiguration 0x1d
-		// (that is curtain-only; we do not curtain).
+		// SetEncodings (0x02, 56B): count=13, HP_ENCODINGS_FULL. SetDisplayConfiguration 0x1d is sent between
+		// the ViewerInfo settle and this, but ONLY when `settings.highPerformanceDisplay` is set (it curtains
+		// the host — see below); with the default `nil` this prelude is byte-for-byte unchanged.
 		let setEncodings: [UInt8] = [
 			0x02,0x00,0x00,0x0d,
 			0x00,0x00,0x03,0xf2, 0x00,0x00,0x03,0xf3, 0x00,0x00,0x03,0xea,
@@ -429,6 +430,28 @@ private extension VNCConnection {
 		do {
 			try await connection.write(data: Data(viewerInfoPlus12))
 			try await Task.sleep(nanoseconds: 100_000_000)   // _POST_VIEWERINFO_SETTLE_S = 0.1s
+
+			// OPT-IN virtual display (0x1d SetDisplayConfiguration), between ViewerInfo+0x12 and SetEncodings —
+			// the ordering the reference uses, and it must go out here while the record layer is still in
+			// passthrough (plaintext); `activateRecordLayer()` is not called until after the 1103 rekey below.
+			//
+			// Why: without 0x1d the daemon encodes the host's PHYSICAL panel. On a 5120×1440 ultrawide that is
+			// 7.37 Mpx of 4:4:4 per frame, which saturates the A18 hardware decoder (~4 ms/AU measured,
+			// busyFrac 1.00) and degrades into unbounded slow-motion. Asking for a smaller virtual display is
+			// how Apple's own client avoids this. Sent BEFORE the 0x1c media offer so the FIRST 0x1c answer
+			// already carries the reduced canvas (no 0x451 resize dance, no 0x1c re-offer — neither of which
+			// this fork implements).
+			//
+			// ⚠️ This CURTAINS the host (physical screen stops showing the desktop; window layout reflows and
+			// stays reflowed after disconnect), so it is strictly opt-in — `nil` sends nothing.
+			if let display = settings.highPerformanceDisplay {
+				let sdc = Apple0x1dSetDisplayConfiguration.build(logicalWidth: display.logicalWidth,
+																 logicalHeight: display.logicalHeight,
+																 hidpiScale: display.hidpiScale)
+				try await connection.write(data: sdc)
+				logger.logDebug("[hp-vdisp] sent 0x1d SetDisplayConfiguration (\(sdc.count) B) backing=\(display.pixelWidth)x\(display.pixelHeight) points=\(display.logicalWidth)x\(display.logicalHeight) hidpi=\(display.hidpiScale) — HOST IS NOW CURTAINED")
+			}
+
 			try await connection.write(data: Data(setEncodings))
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send HP Prelude",
