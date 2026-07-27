@@ -17,12 +17,16 @@ public extension VNCConnection.Settings {
 		/// Backing pixels the encoder is asked to produce (and we must decode) — the cost-determining number.
 		public let pixelWidth: Int
 		public let pixelHeight: Int
-		/// Logical (point) size that goes on the `0x1d` wire. STORED rather than derived, because the
-		/// backing:point ratio is not required to be an integer: the mode table carries `pixelWidth/Height`
-		/// and `pointWidth/Height` as independent u32 fields, so 1.5 (e.g. 2868 px over 1912 pt) is
-		/// expressible. That matters on a phone — 2× Retina rendering fixes text quality but halves the
-		/// desktop area in each axis, which makes windows and text feel oversized; 1.5 keeps most of the
-		/// quality win with a third more usable area at the SAME decode cost.
+		/// Logical (point) size that goes on the `0x1d` wire. STORED rather than derived, because the WIRE does
+		/// not require the backing:point ratio to be an integer: the mode table carries `pixelWidth/Height` and
+		/// `pointWidth/Height` as independent u32 fields, so 1.5 (e.g. 2868 px over 1912 pt) is expressible.
+		///
+		/// ⚠️ **But the HOST rejects a fractional ratio — do not use one without re-testing live.** Requesting
+		/// `backing=994x2160 points=662x1440` (ratio 1.5015) made `screensharingd` discard the geometry entirely
+		/// and fall back to its safe minimum, answering `0x451` with `scaled=800x600 backing=1600x1200` (ratio
+		/// exactly 2.0) — confirmed host-side. SkyLight validates the mode table against integer backing scale
+		/// factors. The fractional capability is retained here because the finding is about the host's
+		/// validation rather than our encoding, but callers should pass an integer (the app passes 2).
 		public let logicalWidth: Int
 		public let logicalHeight: Int
 
