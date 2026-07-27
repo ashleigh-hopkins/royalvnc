@@ -134,6 +134,67 @@ enum AppleControlChannelCodec {
         return FBUWalk(declaredRects: declaredRects, parsedRects: parsed, layout: lastLayout, stoppedEarly: false, cursors: cursors)
     }
 
+    // MARK: - Standalone 0x451 layout parsing
+
+    /// Parse a `0x451` AppleDisplayLayout **body** (starting at its `u16 prefix_len`) that the caller has
+    /// already framed — e.g. the pre-rekey rect walk, which reads rects field-by-field off the socket
+    /// rather than walking an in-memory FBU. Returns `nil` when `prefix_len < 10` (no geometry present)
+    /// or the body is truncated.
+    static func parseDisplayLayoutBody(_ body: Data) -> LayoutInfo? {
+        displayLayoutBody([UInt8](body), 0).1
+    }
+
+    // MARK: - Standalone 0x451 layout scan
+
+    /// Smallest plausible virtual-display / panel dimension. Guards the scan below against a random
+    /// byte run that happens to look like a layout rect.
+    private static let minPlausibleDimension = 64
+    /// Largest plausible dimension. The daemon caps a virtual display at 3840×2160 and no Apple panel
+    /// exceeds 8K wide; a u16 field can hold 65535, so this is what separates a real layout from noise.
+    private static let maxPlausibleDimension = 8192
+
+    /// Find the LAST `0x451` AppleDisplayLayout geometry in an arbitrary plaintext buffer.
+    ///
+    /// `walkFramebufferUpdate` is the correct parser and is preferred wherever the buffer is known to
+    /// start at a `0x00` FramebufferUpdate boundary. This is for the one place that isn't: the media
+    /// negotiation read, which accumulates whatever the record layer hands back and may begin mid-message
+    /// or span several messages. There it is the difference between learning the host's new geometry and
+    /// blocking forever waiting for a `0x1c` answer that never comes.
+    ///
+    /// HEURISTIC, deliberately: it searches for the 4-byte encoding number `00 00 04 51` and reads the
+    /// layout fields at their fixed offsets from it (rect header = 4×u16 then the s32 encoding, so the
+    /// body's `prefix_len` sits at +4 and the four dimensions at +8/+10/+12/+14). A match is accepted only
+    /// when `prefix_len >= 10`, the whole body is present, and BOTH backing dimensions are inside
+    /// `minPlausibleDimension...maxPlausibleDimension` — a zero/absurd match is treated as a false
+    /// positive and the scan continues. Returns `nil` when nothing survives that filter.
+    static func scanForDisplayLayout(_ data: Data) -> LayoutInfo? {
+        let b = [UInt8](data)
+        guard b.count >= 16 else { return nil }
+
+        var found: LayoutInfo?
+        var i = 0
+
+        while i <= b.count - 16 {
+            guard b[i] == 0x00, b[i + 1] == 0x00, b[i + 2] == 0x04, b[i + 3] == 0x51 else {
+                i += 1
+                continue
+            }
+
+            let bodyOffset = i + 4                       // points at `prefix_len`
+            let (_, layout) = displayLayoutBody(b, bodyOffset)
+
+            if let layout,
+               (minPlausibleDimension...maxPlausibleDimension).contains(layout.backingWidth),
+               (minPlausibleDimension...maxPlausibleDimension).contains(layout.backingHeight) {
+                found = layout                           // keep the last plausible one
+            }
+
+            i += 4
+        }
+
+        return found
+    }
+
     // MARK: - Per-encoding body sizing (bytes past the 12-byte rect header)
 
     /// `1104` cursor body: `u32 cache_id, u32 comp_size`, then `comp_size` bytes when nonzero (crib §7b).

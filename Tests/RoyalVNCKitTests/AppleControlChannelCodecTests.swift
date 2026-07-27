@@ -314,4 +314,77 @@ final class AppleControlChannelCodecTests: XCTestCase {
         msg[8] = 0xFF; msg[9] = 0xFF; msg[10] = 0xFF; msg[11] = 0xF0
         XCTAssertThrowsError(try AppleClipboardCodec.decodeInboundText(Data(msg)))
     }
+
+    // MARK: - Standalone 0x451 body parse (pre-rekey rect walk)
+
+    /// The pre-rekey walk reads rects field-by-field off the socket, so it hands the codec a body it has
+    /// re-framed itself (`u16 prefix_len` + payload) rather than a whole FBU.
+    func testParseDisplayLayoutBodyReadsGeometry() {
+        // layoutRect() = 12-byte rect header + the body; drop the header to get the body alone.
+        let body = Data(layoutRect(prefixLen: 12, scaledW: 1712, scaledH: 1112, backingW: 2868, backingH: 1320).dropFirst(12))
+
+        XCTAssertEqual(AppleControlChannelCodec.parseDisplayLayoutBody(body),
+                       .init(scaledWidth: 1712, scaledHeight: 1112, backingWidth: 2868, backingHeight: 1320))
+    }
+
+    func testParseDisplayLayoutBodyRejectsShortPrefixAndTruncation() {
+        let noGeometry = Data(layoutRect(prefixLen: 4, scaledW: 0, scaledH: 0, backingW: 0, backingH: 0).dropFirst(12))
+        XCTAssertNil(AppleControlChannelCodec.parseDisplayLayoutBody(noGeometry),
+                     "prefix_len < 10 carries no dimensions")
+
+        let full = Data(layoutRect(prefixLen: 12, scaledW: 1, scaledH: 2, backingW: 3, backingH: 4).dropFirst(12))
+        XCTAssertNil(AppleControlChannelCodec.parseDisplayLayoutBody(full.prefix(6)),
+                     "a truncated body must not be parsed from out-of-bounds bytes")
+        XCTAssertNil(AppleControlChannelCodec.parseDisplayLayoutBody(Data()))
+    }
+
+    // MARK: - Standalone 0x451 scan (media-negotiation buffer)
+
+    /// The media-negotiation read accumulates whatever the record layer returns, which may start
+    /// mid-message — so the layout is located by scanning for the encoding number rather than by walking
+    /// an FBU from its header.
+    func testScanForDisplayLayoutFindsLayoutMidBuffer() {
+        var buffer = [UInt8](repeating: 0x77, count: 37)   // leading partial message
+        buffer += layoutRect(prefixLen: 12, scaledW: 1712, scaledH: 1112, backingW: 2868, backingH: 1320)
+        buffer += [UInt8](repeating: 0x11, count: 20)      // trailing bytes
+
+        XCTAssertEqual(AppleControlChannelCodec.scanForDisplayLayout(Data(buffer)),
+                       .init(scaledWidth: 1712, scaledHeight: 1112, backingWidth: 2868, backingHeight: 1320))
+    }
+
+    /// Two layouts in one buffer (a display transition mid-read): the LAST one is the current geometry.
+    func testScanForDisplayLayoutPrefersTheLastPlausibleMatch() {
+        var buffer = layoutRect(prefixLen: 12, scaledW: 1920, scaledH: 1080, backingW: 1920, backingH: 1080)
+        buffer += layoutRect(prefixLen: 12, scaledW: 1712, scaledH: 1112, backingW: 2868, backingH: 1320)
+
+        XCTAssertEqual(AppleControlChannelCodec.scanForDisplayLayout(Data(buffer))?.backingWidth, 2868)
+    }
+
+    /// The scan is a heuristic over arbitrary bytes, so implausible "matches" must be rejected — otherwise
+    /// a random `00 00 04 51` run would size the framebuffer (and the video path) from garbage.
+    func testScanForDisplayLayoutRejectsImplausibleAndAbsentMatches() {
+        XCTAssertNil(AppleControlChannelCodec.scanForDisplayLayout(Data([UInt8](repeating: 0xEE, count: 200))),
+                     "no encoding number present")
+
+        // A `00 00 04 51` run followed by zero dimensions — the shape of a false positive.
+        let zeroDims = layoutRect(prefixLen: 12, scaledW: 0, scaledH: 0, backingW: 0, backingH: 0)
+        XCTAssertNil(AppleControlChannelCodec.scanForDisplayLayout(Data(zeroDims)),
+                     "zero backing dimensions are not a usable canvas")
+
+        // Absurd dimensions (u16 max) must not be accepted as a display.
+        let absurd = layoutRect(prefixLen: 12, scaledW: 65535, scaledH: 65535, backingW: 65535, backingH: 65535)
+        XCTAssertNil(AppleControlChannelCodec.scanForDisplayLayout(Data(absurd)),
+                     "65535x65535 is noise, not a panel")
+
+        XCTAssertNil(AppleControlChannelCodec.scanForDisplayLayout(Data([0x00, 0x00, 0x04, 0x51])),
+                     "the encoding number alone, with no body, must not parse")
+    }
+
+    /// A real layout must still be found when a false positive precedes it.
+    func testScanForDisplayLayoutSkipsFalsePositiveThenFindsReal() {
+        var buffer = layoutRect(prefixLen: 12, scaledW: 0, scaledH: 0, backingW: 0, backingH: 0)
+        buffer += layoutRect(prefixLen: 12, scaledW: 1712, scaledH: 1112, backingW: 2868, backingH: 1320)
+
+        XCTAssertEqual(AppleControlChannelCodec.scanForDisplayLayout(Data(buffer))?.backingHeight, 1320)
+    }
 }

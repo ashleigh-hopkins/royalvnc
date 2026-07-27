@@ -113,6 +113,32 @@ final class AppleHighPerformanceGatingTests: XCTestCase {
                        "a start time in the future (clock step) must clamp to 0, never go negative")
     }
 
+    // MARK: - Canvas derived from a 0x451 layout (virtual-display fallback)
+
+    /// A virtual-display connect gets no `0x1c` answer canvas, so the framebuffer + video geometry come
+    /// from the `0x451` layout's BACKING dimensions — those are what the encoder actually emits. Getting
+    /// scaled-vs-backing the wrong way round here would paint full-resolution tiles into an
+    /// undersized buffer (the exact stretched/blocky failure this replaces).
+    func testCanvasFromLayoutUsesBackingDimensionsAndOfferedTiles() {
+        let layout = AppleControlChannelCodec.LayoutInfo(scaledWidth: 1712, scaledHeight: 1112,
+                                                         backingWidth: 2868, backingHeight: 1320)
+        let canvas = VNCConnection.canvasFromLayout(layout, offeredTileCount: 4, offeredLTRP: true)
+
+        XCTAssertEqual(canvas.width, 2868, "width must be the BACKING width, not the scaled width")
+        XCTAssertEqual(canvas.height, 1320, "height must be the BACKING height, not the scaled height")
+        XCTAssertEqual(canvas.tileCount, 4, "tile count comes from what we offered (not in the layout)")
+        XCTAssertTrue(canvas.ltrpEnabled)
+        XCTAssertTrue(canvas.isReady, "a layout-derived canvas must satisfy isReady so negotiation proceeds")
+    }
+
+    /// A zero-dimension layout must NOT produce a usable canvas — the caller relies on `isReady` being
+    /// false to fall through to its fail-fast (lift the curtain) rather than proceeding with a 0×0 buffer.
+    func testCanvasFromLayoutWithZeroBackingIsNotReady() {
+        let empty = AppleControlChannelCodec.LayoutInfo(scaledWidth: 1920, scaledHeight: 1080,
+                                                        backingWidth: 0, backingHeight: 0)
+        XCTAssertFalse(VNCConnection.canvasFromLayout(empty, offeredTileCount: 4, offeredLTRP: true).isReady)
+    }
+
     private static func makeSettings(enableHighPerformance: Bool) -> VNCConnection.Settings {
         VNCConnection.Settings(isDebugLoggingEnabled: false,
                                hostname: "localhost",

@@ -93,18 +93,32 @@ extension VNCConnection {
         // the request — i.e. the whole handshake is paid twice. Per-attempt + total timings distinguish
         // "slow but converged" from "exhausted and retried", which need different fixes.
         let negotiationStart = Date()
-        var canvas = try await readMediaAnswer()
-        logger.logDebug("[hp-media] first answer read in \(Self.hpElapsedMs(since: negotiationStart))ms (ready=\(canvas.isReady))")
+        var (canvas, layout) = try await readMediaAnswer()
+        logger.logDebug("[hp-media] first answer read in \(Self.hpElapsedMs(since: negotiationStart))ms (ready=\(canvas.isReady), layout=\(layout.map { "\($0.backingWidth)x\($0.backingHeight)" } ?? "none"))")
         var attempts = 0
-        while !canvas.isReady, attempts < 16 {
+        while !canvas.isReady, layout == nil, attempts < 16 {
             attempts += 1
             let attemptStart = Date()
             logger.logDebug("[hp-media] degenerate canvas, re-sending 0x1c (attempt \(attempts))")
             try await connection.write(data: offer)
             try await Task.sleep(nanoseconds: 200_000_000)   // _DEGENERATE_RETRY_INTERVAL_S = 0.2s
-            canvas = try await readMediaAnswer()
+            (canvas, layout) = try await readMediaAnswer()
             logger.logDebug("[hp-media] attempt \(attempts) took \(Self.hpElapsedMs(since: attemptStart))ms (ready=\(canvas.isReady), \(Self.hpElapsedMs(since: negotiationStart))ms cumulative)")
         }
+
+        // No canvas in the answer, but the daemon told us the geometry in a `0x451` — either during this
+        // read or back in the pre-rekey burst. Use it: that IS the encoder's output size, and it is the only
+        // geometry a virtual-display connect gets.
+        if !canvas.isReady, let announced = layout ?? appleHPPendingLayout {
+            let derived = Self.canvasFromLayout(announced,
+                                                offeredTileCount: config.blob.tilesPerFrame,
+                                                offeredLTRP: true)
+            if derived.isReady {
+                canvas = derived
+                logger.logDebug("[hp-vdisp] no 0x1c answer canvas — taking geometry from the 0x451 layout: \(canvas.width)x\(canvas.height) (scaled \(announced.scaledWidth)x\(announced.scaledHeight), tiles=\(canvas.tileCount) from our offer)")
+            }
+        }
+        appleHPPendingLayout = nil
 
         logger.logDebug("[hp-media] answer canvas \(canvas.width)x\(canvas.height) tiles=\(canvas.tileCount) ltrp=\(canvas.ltrpEnabled) ready=\(canvas.isReady) — negotiated in \(Self.hpElapsedMs(since: negotiationStart))ms after \(attempts) retries")
 
@@ -163,23 +177,54 @@ extension VNCConnection {
         // for one connect). Only applies when WE asked for the virtual display; the plain HP path is
         // unchanged (a degenerate canvas there is the pre-existing, non-curtaining behaviour).
         if !canvas.isReady, settings.highPerformanceDisplay != nil {
-            logger.logError("[hp-vdisp] virtual display was requested but the host never returned a usable canvas after \(attempts) retries / \(Self.hpElapsedMs(since: negotiationStart))ms — failing the connection so the curtain lifts instead of leaving a blank, curtained host (the caller's next connect omits the request, so this whole handshake is about to be paid again)")
+            logger.logError("[hp-vdisp] virtual display was requested but the host produced NEITHER a 0x1c answer canvas NOR a 0x451 layout after \(attempts) retries / \(Self.hpElapsedMs(since: negotiationStart))ms — failing the connection so the curtain lifts instead of leaving a blank, curtained host (the caller's next connect omits the request, so this whole handshake is about to be paid again)")
             throw VNCError.protocol(.invalidData)
         }
     }
 
     /// Accumulate decrypted plaintext off the record layer until an answer with a nonzero canvas is
     /// found (crib §2a: recv a batch, scan for the embedded bplist). Bounded to avoid spinning.
-    private func readMediaAnswer() async throws -> Apple0x1cAnswer.Canvas {
+    ///
+    /// ALSO stops on a `0x451` AppleDisplayLayout. A virtual-display (`0x1d`) connect does not behave like
+    /// the plain HP path: the daemon announces the new geometry with a `0x451` and starts streaming video
+    /// immediately, and no `0x1c` answer with a canvas follows on TCP — so waiting only for a bplist canvas
+    /// blocks here forever (device-observed: video decoding at full rate while negotiation never returned,
+    /// leaving the decoded-frame handler unwired and the framebuffer stuck at the ServerInit size). The
+    /// layout is the geometry, so treat it as an answer. Chunk sizes are logged (bounded) because if this
+    /// ever stalls again, "did any plaintext arrive at all" is the first thing to know.
+    private func readMediaAnswer() async throws -> (canvas: Apple0x1cAnswer.Canvas, layout: AppleControlChannelCodec.LayoutInfo?) {
         var buffer = Data()
-        for _ in 0..<32 {
+        for readIndex in 0..<32 {
             let chunk = try await connection.read(minimumLength: 1, maximumLength: 65535)
             buffer.append(chunk)
+            if readIndex < 4 {
+                logger.logDebug("[hp-media] answer read #\(readIndex + 1): +\(chunk.count)B (buffer \(buffer.count)B)")
+            }
+
             let canvas = Apple0x1cAnswer.parse(buffer)
-            if canvas.isReady { return canvas }
+            if canvas.isReady { return (canvas, AppleControlChannelCodec.scanForDisplayLayout(buffer)) }
+
+            if let layout = AppleControlChannelCodec.scanForDisplayLayout(buffer) {
+                return (canvas, layout)
+            }
+
             if buffer.count > 262_144 { break }   // 256 KiB safety cap
         }
-        return Apple0x1cAnswer.parse(buffer)
+        return (Apple0x1cAnswer.parse(buffer), AppleControlChannelCodec.scanForDisplayLayout(buffer))
+    }
+
+    /// The canvas implied by a `0x451` layout, for the virtual-display case where no `0x1c` answer canvas
+    /// arrives. `backingWidth/Height` are the encoder's real output — the same numbers the answer's
+    /// `sub4/sub5` would have carried — so they size the framebuffer. `tileCount`/`ltrpEnabled` are not in
+    /// the layout, so they are taken from what we OFFERED (the daemon honours the 4-tile offer natively);
+    /// the tile count is re-derived from the stream anyway once frames arrive.
+    static func canvasFromLayout(_ layout: AppleControlChannelCodec.LayoutInfo,
+                                 offeredTileCount: Int,
+                                 offeredLTRP: Bool) -> Apple0x1cAnswer.Canvas {
+        Apple0x1cAnswer.Canvas(width: UInt32(max(0, layout.backingWidth)),
+                               height: UInt32(max(0, layout.backingHeight)),
+                               tileCount: UInt32(max(0, offeredTileCount)),
+                               ltrpEnabled: offeredLTRP)
     }
 
     private static func random32(_ rnd: (Int) throws -> Data) throws -> UInt32 {

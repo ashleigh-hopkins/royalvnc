@@ -573,7 +573,21 @@ private extension VNCConnection {
 				// buffer, and the first AES-128-CBC record then parses that plaintext as ciphertext → a
 				// bogus length → a read that never completes = the connection hangs at "connecting".
 				let size = try await connection.readUInt16()
-				_ = try await connection.readBuffered(length: Int(size))
+				let body = try await connection.readBuffered(length: Int(size))
+
+				// A pre-rekey `0x451` is not merely skippable noise — it is the daemon ANNOUNCING the
+				// geometry our `0x1d` just asked for. Keep it: media negotiation uses it as the canvas when
+				// the `0x1c` answer carries none (which is what a virtual-display connect does in practice).
+				// The body read here starts one u16 past the `prefix_len` field the codec expects, so
+				// re-prepend that length prefix before parsing.
+				if Int(encoding) == AppleControlChannelCodec.encDisplayLayout {
+					var framed = Data([UInt8(size >> 8), UInt8(size & 0xFF)])
+					framed.append(contentsOf: body)
+					if let layout = AppleControlChannelCodec.parseDisplayLayoutBody(framed) {
+						appleHPPendingLayout = layout
+						logger.logDebug("[hp-rekey] pre-rekey 0x451 layout scaled=\(layout.scaledWidth)x\(layout.scaledHeight) backing=\(layout.backingWidth)x\(layout.backingHeight) — retained for the media canvas")
+					}
+				}
 				logger.logDebug("[hp-rekey] skipped pre-rekey rect encoding=\(encoding) len=\(size)")
 			} else if Int(encoding) == AppleControlChannelCodec.encCursor {
 				// `1104` cursor: `u32 cache_id, u32 comp_size` then comp_size bytes (0 = cache hit).
