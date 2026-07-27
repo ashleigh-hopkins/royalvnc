@@ -96,6 +96,17 @@ extension VNCConnection {
 
         logger.logDebug("[hp-media] answer canvas \(canvas.width)x\(canvas.height) tiles=\(canvas.tileCount) ltrp=\(canvas.ltrpEnabled) ready=\(canvas.isReady)")
 
+        // Geometry note: the canvas can legitimately differ from ServerInit (which describes the host's
+        // PHYSICAL display and was read before this negotiation). The framebuffer is created AFTER this call
+        // returns and takes its size from this canvas, so the difference is expected and handled — logged
+        // because it is the single most useful line for explaining a wrong-looking picture.
+        if canvas.isReady {
+            let fbW = Int(state.framebufferWidth), fbH = Int(state.framebufferHeight)
+            if fbW > 0, fbH > 0, fbW != Int(canvas.width) || fbH != Int(canvas.height) {
+                logger.logDebug("[hp-geom] canvas \(canvas.width)x\(canvas.height) differs from ServerInit \(fbW)x\(fbH) (virtual display) — framebuffer will follow the canvas")
+            }
+        }
+
         if canvas.isReady {
             // AutoFrameBufferUpdate 0x09 (16 B fixed, crib §2b.5) — sent only after a nonzero canvas.
             var fbu09: [UInt8] = [0x09, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0]
@@ -129,6 +140,20 @@ extension VNCConnection {
         appleHPMediaContext = AppleHPMediaContext(
             audioKeyV: akv, audioKeyS: aks, videoKeyV: vkv, videoKeyS: vks,
             videoSSRC: ssrcs?.video ?? 0, audioSSRC: ssrcs?.audio ?? 0, canvas: canvas)
+
+        // FAIL FAST when a requested virtual display produced no canvas.
+        //
+        // Without this the session stays "connected" with the media sockets torn down: the client shows a
+        // connected-but-blank screen while the HOST IS CURTAINED — its physical screen is blank and the only
+        // tool that could see it just silently gave up. That is the worst possible failure for a machine the
+        // user may not be sitting at. Throwing tears the connection down, which drops the daemon's virtual
+        // display and lifts the curtain, and lets the caller retry WITHOUT the request (the app suppresses it
+        // for one connect). Only applies when WE asked for the virtual display; the plain HP path is
+        // unchanged (a degenerate canvas there is the pre-existing, non-curtaining behaviour).
+        if !canvas.isReady, settings.highPerformanceDisplay != nil {
+            logger.logError("[hp-vdisp] virtual display was requested but the host never returned a usable canvas after \(attempts) retries — failing the connection so the curtain lifts instead of leaving a blank, curtained host")
+            throw VNCError.protocol(.invalidData)
+        }
     }
 
     /// Accumulate decrypted plaintext off the record layer until an answer with a nonzero canvas is

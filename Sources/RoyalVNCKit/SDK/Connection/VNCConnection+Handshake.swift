@@ -339,8 +339,27 @@ private extension VNCConnection {
 			}
 		}
 
-		let framebufferSize = VNCSize(width: serverInit.framebufferWidth,
+		var framebufferSize = VNCSize(width: serverInit.framebufferWidth,
 									  height: serverInit.framebufferHeight)
+
+		// HP + virtual display: the VIDEO CANVAS is authoritative for geometry, not ServerInit.
+		//
+		// ServerInit is read before the HP control bring-up (which is where the `0x1d` request and the `0x1c`
+		// negotiation happen), so it still describes the host's PHYSICAL display. If we asked for a virtual
+		// display of a different size, sizing the framebuffer from ServerInit leaves the decoded video — whose
+		// tiles are sized to the canvas — painted into the wrong-shaped buffer: the picture comes out at the
+		// wrong resolution and stretched, and pointer mapping (which derives from `framebuffer.size`) is off
+		// by the same ratio. Note we cannot `recreateFramebuffer` after negotiating, because negotiation runs
+		// INSIDE the bring-up call above and the framebuffer does not exist yet — so create it at the right
+		// size in the first place.
+		if settings.enableHighPerformance,
+		   let canvas = appleHPMediaContext?.canvas,
+		   canvas.isReady,
+		   canvas.width <= UInt32(UInt16.max), canvas.height <= UInt32(UInt16.max),
+		   canvas.width != UInt32(framebufferSize.width) || canvas.height != UInt32(framebufferSize.height) {
+			logger.logDebug("[hp-geom] framebuffer sized from the VIDEO CANVAS \(canvas.width)x\(canvas.height) instead of ServerInit \(framebufferSize.width)x\(framebufferSize.height) (virtual display active)")
+			framebufferSize = VNCSize(width: UInt16(canvas.width), height: UInt16(canvas.height))
+		}
 
         let newFramebuffer = try VNCFramebuffer(logger: logger,
                                                 size: framebufferSize,
@@ -534,11 +553,29 @@ private extension VNCConnection {
 			let encoding = try await connection.readUInt32()   // s32 BE encoding (all positive here)
 			if encoding == 1103 {
 				return try await connection.readBuffered(length: AppleRecordKeySchedule.rekeyLength)
-			} else if encoding == 1010 || encoding == 1011 {
+			} else if AppleControlChannelCodec.lengthPrefixedConfigEncodings.contains(Int(encoding))
+						|| Int(encoding) == AppleControlChannelCodec.encDisplayLayout {
+				// All of these share `u16 size + size bytes` framing (crib §7b). `0x451` AppleDisplayLayout
+				// MUST be skipped here, not treated as unknown: requesting a virtual display (0x1d) is a
+				// geometry change, and the daemon announces the new geometry with a 0x451 that can land in
+				// this same pre-rekey burst. Breaking out on it strands the rest of the burst in the read
+				// buffer, and the first AES-128-CBC record then parses that plaintext as ciphertext → a
+				// bogus length → a read that never completes = the connection hangs at "connecting".
 				let size = try await connection.readUInt16()
 				_ = try await connection.readBuffered(length: Int(size))
+				logger.logDebug("[hp-rekey] skipped pre-rekey rect encoding=\(encoding) len=\(size)")
+			} else if Int(encoding) == AppleControlChannelCodec.encCursor {
+				// `1104` cursor: `u32 cache_id, u32 comp_size` then comp_size bytes (0 = cache hit).
+				_ = try await connection.readUInt32()
+				let compSize = try await connection.readUInt32()
+				if compSize > 0 { _ = try await connection.readBuffered(length: Int(compSize)) }
+				logger.logDebug("[hp-rekey] skipped pre-rekey cursor rect comp=\(compSize)")
 			} else {
-				break                                          // unknown encoding → stop
+				// Unknown length → we cannot skip it without desyncing, so stop. Log the encoding: without
+				// it this failure is an opaque `.invalidData` (or a hang) with no way to tell which rect the
+				// daemon sent.
+				logger.logError("[hp-rekey] UNKNOWN pre-rekey rect encoding=\(encoding) (0x\(String(encoding, radix: 16))) — cannot skip; aborting rekey read")
+				break
 			}
 		}
 		throw VNCError.protocol(.invalidData)                  // no 1103 rect found
