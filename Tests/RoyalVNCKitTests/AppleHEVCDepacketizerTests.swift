@@ -91,6 +91,39 @@ final class AppleHEVCDepacketizerTests: XCTestCase {
         XCTAssertFalse(AppleHEVCDepacketizer.isIRAP(1))
     }
 
+    // MARK: - firstDONL (LTR-ACK id derivation)
+
+    func testFirstDONLFromAggregationPacket() {
+        // AP: DONL is the BE16 at offset 2 (APhdr[2] | DONL[2] | …).
+        let ap = Data([0x60, 0x01, 0x00, 0x03, 0x00, 0x03, 0x40, 0x01, 0xCC])
+        XCTAssertEqual(AppleHEVCDepacketizer.firstDONL([ap], donl: true), 0x0003)
+    }
+
+    func testFirstDONLFromSingleNAL() {
+        // Single NAL: DONL is the BE16 at offset 2 (NALhdr[2] | DONL[2] | payload).
+        let sps = Data([0x42, 0x01, 0x12, 0x34, 0xAA, 0xBB])
+        XCTAssertEqual(AppleHEVCDepacketizer.firstDONL([sps], donl: true), 0x1234)
+    }
+
+    func testFirstDONLFromFragmentationUnit() {
+        // FU: DONL is the BE16 at offset 3 (FUhdr[2] | FUheader[1] | DONL[2] | fragment).
+        let fuStart = Data([0x62, 0x01, 0x81, 0xAB, 0xCD, 0x11, 0x22])
+        XCTAssertEqual(AppleHEVCDepacketizer.firstDONL([fuStart], donl: true), 0xABCD)
+    }
+
+    func testFirstDONLNilWhenDONLAbsent() {
+        let ap = Data([0x60, 0x01, 0x00, 0x03, 0x40, 0x01, 0xCC])
+        XCTAssertNil(AppleHEVCDepacketizer.firstDONL([ap], donl: false))
+    }
+
+    func testFirstDONLNilWhenEmptyOrTooShort() {
+        XCTAssertNil(AppleHEVCDepacketizer.firstDONL([], donl: true))
+        // FU header present but no room for a 2-byte DONL at offset 3 (needs >= 5 bytes).
+        XCTAssertNil(AppleHEVCDepacketizer.firstDONL([Data([0x62, 0x01, 0x81, 0x00])], donl: true))
+        // Single NAL: header only, no DONL room (needs >= 4 bytes).
+        XCTAssertNil(AppleHEVCDepacketizer.firstDONL([Data([0x42, 0x01, 0x00])], donl: true))
+    }
+
     // MARK: - Assembler
 
     func testAssemblerFlushesOnMarkerInSeqOrder() {

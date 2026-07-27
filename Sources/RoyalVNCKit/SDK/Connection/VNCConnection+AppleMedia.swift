@@ -53,13 +53,17 @@ extension VNCConnection {
             audioSessionID: try Self.random32(rnd), audioTimestamp: Self.nowNanos(),
             audioPlistCallID: UUID())
 
-        // tilesPerFrame=1: one self-contained full-frame stream (like Apple's own client) → every frame
-        // IDR-recoverable → any loss recovers on the next FIR-IDR, fixing the 4-tile tile-1-3-can't-recover
-        // stalls. screensharingd honors it (single SSRC). Making the fork decode the single 1920×1080 stream
-        // is under active work (WIP).
+        // tilesPerFrame=4: Apple's NATIVE/default offer (the reference documents 4 tiles). This is the
+        // 1-char revert point — flip back to `1` for a single-tile A/B. The 4-tile offer is what re-arms
+        // the negotiated LTR handshake: single-tile Apple RTP carries NO 16-bit DONL, so `ltrp=1` is inert
+        // (no per-frame id to ACK) and on loss we fall back to fragile full-IDR recovery → the 1–3.4 s FMV
+        // freeze. 4 tiles restore the DONL, so a cleanly-decoded tile-0 frame can be ACKed (PT204 LTR-ACK on
+        // the video socket, chain-clean-gated) and the encoder re-roots from a small P-delta LTR instead of
+        // a full IDR. screensharingd honors the 4-SSRC offer natively. (AppleMediaBlobCodec.Config already
+        // defaults tilesPerFrame:4/codec:.both/ltrpEnabled:true — blob fields 2 & 7 carry the LTRP flag.)
         let config = Apple0x1cOffer.Config(
             flags: .standard,
-            blob: .init(tilesPerFrame: 1),
+            blob: .init(tilesPerFrame: 4),
             remoteEndpointInfo: AppleMediaBlobCodec.buildRemoteEndpointInfo(hwModel: "Mac", avcVersion: "1.0.0", osBuild: "0"))
 
         let offer = try Apple0x1cOffer.build(config: config, params: params)
@@ -106,6 +110,9 @@ extension VNCConnection {
             // in the background, and the RTCP keep-alive loop keeps AVConference streaming past ~30s.
             #if canImport(Network)
             if let media {
+                // Bound the SSRC→tile map to the negotiated geometry (guards mid-session SSRC-group rotation,
+                // which the reference observes right after a 0x1d virtual display is created).
+                if canvas.tileCount > 0 { media.expectedTileCount = Int(canvas.tileCount) }
                 media.startRTCPKeepAlive(videoKeyV: vkv, senderSSRC: ssrcs?.video ?? 0, logger: logger)
                 #if canImport(VideoToolbox)
                 media.onDecodedVideoFrame = appleHPDecodedVideoFrameHandler
@@ -322,6 +329,8 @@ extension VNCConnection {
         private var rtcpProtector: AppleSRTCPProtector?
         private var rtcpSenderSSRC: UInt32 = 0
         private var lastLossFirNs: UInt64 = 0   // rate-limit (video worker queue only)
+        /// Retained for the teardown [hp-ab] summary (set when the keep-alive starts).
+        private var diagLogger: VNCLogger?
 
         // HP HEVC decode pipeline (crib §8): assemble AUs by (ssrc,ts) + marker, depay (DONL/AP/FU), feed
         // one shared VideoToolbox session. All touched only on the video socket queue → no locking.
@@ -331,9 +340,77 @@ extension VNCConnection {
         /// defaults to true (4-tile behavior) until an AP is seen. Getting it wrong drops params / corrupts FUs.
         private var hevcDONL = true
         private var hevcKnownSSRCs: [UInt32] = []
+        /// Tiles the negotiated canvas says to expect (set from the `0x1c` answer). Bounds the SSRC→tile map so
+        /// a mid-session SSRC-group rotation can't inflate tile indices past the geometry. Defaults to the
+        /// 4-tile offer we send.
+        var expectedTileCount = 4
+        /// Last SSRC-group reset (video worker queue) — ≥3 s coalescing guard, matching the reference.
+        private var lastSSRCGroupResetNs: UInt64 = 0
+        /// TEMP-MEASUREMENT ([hp-tile]): per-SSRC set of HEVC NAL types EVER seen — decisive for tile
+        /// independence. If every tile carries its own SPS(33)+IDR(19/20), the 4 streams are independent
+        /// (→ 4 parallel VTDecompressionSessions viable). If only tile-0 carries SPS/IDR, tiles 1-3
+        /// cross-reference tile-0 (shared DPB → cannot split). Logged when a tile's type-set grows.
+        private var splitWinStartNs: UInt64 = 0   // TEMP-MEASUREMENT [hp-split] window
+        private var tileTypeSets: [UInt32: Set<Int>] = [:]
+        private var tileIRAPCounts: [UInt32: Int] = [:]
         private(set) var hevcFramesDecoded = 0
         private var hevcLoggedFirstFrame = false
         private(set) var hevcDroppedGappedAUs = 0
+
+        // MARK: - LTR (long-term reference) recovery — the FMV-freeze fix
+
+        /// Per-tile chain-clean gate (§1.3b). Touched ONLY on the video worker queue (same queue as
+        /// `handleDecryptedVideo`/`onFrame`), so no locking. `chainClean[tile] == true` means that tile's
+        /// decoder chain descends from an intact, re-rooted IRAP with no gap since — the ONLY state in which
+        /// it is safe to ACK an LTR. VideoToolbox conceals a broken chain with `status == noErr` (advancing
+        /// DONL), so `onFrame` firing is NOT a clean-decode signal on its own; ACKing a concealed frame would
+        /// poison the server's LTR ring (re-root from a frame we never cleanly decoded → persistent
+        /// corruption, worse than the freeze). We ACK tile-0 DONLs only while `chainClean[0] == true`.
+        private var chainClean: [UInt32: Bool] = [:]
+        /// ACKs suppressed because the chain was not clean (video worker queue; benign racy read on rtcpQueue
+        /// for the [hp-ltr] line — monotonic Int).
+        private var ltrGateSkips = 0
+
+        /// LTR-ACK egress state — touched ONLY on `rtcpQueue` (serialized with the keep-alive/FIR sends so
+        /// the shared SRTCP protector's monotonic index stays coherent). `lastAckedDONL` deduped on `!=`
+        /// (not `>`) so ACKs resume after the ~18-min 16-bit DONL wrap.
+        private var lastAckedDONL: UInt16?
+        private var ltrAckCount = 0
+        private var ltrDupSuppressed = 0
+        private var ltrWinStartNs: UInt64 = 0
+        private var ltrLoggedFirst = false
+        private var ltrPrevID: UInt32 = 0
+        private var ltrLastID: UInt32 = 0
+
+        // MARK: - Freeze/stall diagnostics ([hp-stall] / [hp-idr] / [hp-ab] / queue depth)
+
+        /// Decoded-output flatline detection (video worker queue only). A gap ≥ 500 ms between decoded
+        /// frames (any tile) = a freeze; on the resuming frame we emit one [hp-stall] line with the deltas
+        /// accumulated over the flatline window (snapshots taken at each decoded output).
+        private var lastDecodedOutputNs: UInt64 = 0
+        private var snapGappedAU = 0
+        private var snapFir = 0
+        private var snapLtrAck = 0
+        private var irapSinceLastOutput = false
+        private var firCount = 0                 // incremented in requestKeyframeOnLoss (worker queue)
+        private var ltrAcksRequested = 0         // LTR-ACKs dispatched from onFrame (worker queue; for [hp-stall])
+        private var lastIRAPNs: UInt64 = 0        // [hp-idr] cadence (worker queue)
+        private var irapCount = 0
+
+        /// Cross-queue diagnostic rollup — guarded by `diagLock` (recv thread bumps queue depth; the video
+        /// worker bumps freeze/IRAP/gapped; `rtcpQueue` bumps LTR-ACK; the rtcp timer reads/resets at 10 s).
+        private let diagLock = NSLock()
+        private var pendingDatagrams = 0
+        private var qDepthMax = 0
+        private var qAgeMaxMs: Double = 0
+        private var abWinStartNs: UInt64 = 0
+        private var abFreezeAccumMs: Double = 0
+        private var abFlatlines = 0
+        private var abMaxFlatlineMs: Double = 0
+        private var abIrap = 0
+        private var abLtrAck = 0
+        private var abGappedAU = 0
+        private var abQDepthMax = 0   // max worker-queue depth within the 10 s AB window ([hp-rtp] resets its own)
 #if canImport(VideoToolbox)
         let hevcDecoder = AppleHEVCDecoder(requireHardware: false)
         /// Set by the app (or a harness) to receive decoded frames — `(pixelBuffer, tileIndex)` — for
@@ -350,9 +427,23 @@ extension VNCConnection {
         /// immediately so the UDP socket queue re-arms `receiveMessage` at once (drains at line rate). The
         /// worker is FIFO so per-SSRC ROC / AU assembly / decode order are preserved. No drop.
         func enqueueVideoDatagram(_ data: Data, logger: VNCLogger) {
+            // Queue depth/age diagnostic: stamp enqueue time + bump the pending count on the recv thread,
+            // decrement + compute the age inside the worker block. Detects self-inflicted backlog (climbing
+            // depth ⇒ we're the bottleneck) vs on-wire loss (low depth ⇒ residual loss is on the link).
+            let tEnq = DispatchTime.now().uptimeNanoseconds
+            diagLock.lock()
+            pendingDatagrams += 1
+            if pendingDatagrams > qDepthMax { qDepthMax = pendingDatagrams }
+            if pendingDatagrams > abQDepthMax { abQDepthMax = pendingDatagrams }
+            diagLock.unlock()
             videoWorkQueue.async { [weak self] in
                 guard let self else { return }
                 let t0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
+                self.diagLock.lock()
+                self.pendingDatagrams -= 1
+                let ageMs = Double(t0 &- tEnq) / 1e6
+                if ageMs > self.qAgeMaxMs { self.qAgeMaxMs = ageMs }
+                self.diagLock.unlock()
                 self.stats.addVideo()
                 guard let dec = self.srtpDecryptor, let (header, payload) = dec.decrypt(packet: data) else {
                     let te = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
@@ -369,8 +460,31 @@ extension VNCConnection {
                 self.handleDecryptedVideo(header: header, payload: payload, logger: logger)
                 let t1 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
                 self.profiler?.recordPacket(busyNs: t1 - t0, decryptNs: tDec - t0, decodeNs: t1 - tDec)
+#if canImport(VideoToolbox)
+                // TEMP-MEASUREMENT [hp-split]: once per wall-second, decompose the per-AU decode cost that
+                // [hp-prof] decodeMs lumps together. vtMs = real HW decode; cbMs = inline downstream callback
+                // (app composite + LTR-ACK); buildMs = sample-buffer construction; sigMs = param re-signature.
+                if self.splitWinStartNs == 0 { self.splitWinStartNs = t0 }
+                if t0 &- self.splitWinStartNs >= 1_000_000_000 {
+                    let p = self.hevcDecoder.takeProbe()
+                    let aus = max(p.aus, 1)
+                    logger.logDebug(String(format: "[hp-split] perAU: vtMs=%.3f cbMs=%.3f buildMs=%.3f sigMs=%.3f | aus=%d feeds=%d totalMs=%.3f",
+                                           Double(p.vtNs) / Double(aus) / 1e6,
+                                           Double(p.cbNs) / Double(aus) / 1e6,
+                                           Double(p.buildNs) / Double(aus) / 1e6,
+                                           Double(p.sigNs) / Double(aus) / 1e6,
+                                           p.aus, p.feeds,
+                                           Double(p.vtNs &+ p.cbNs &+ p.buildNs &+ p.sigNs) / Double(aus) / 1e6))
+                    self.splitWinStartNs = t0
+                }
+#endif
                 if self.stats.decryptedCount % 1000 == 0 {
-                    logger.logDebug("[hp-rtp] decrypted=\(self.stats.decryptedCount) hevc-decoded=\(self.hevcFramesDecoded) droppedGappedAUs=\(self.hevcDroppedGappedAUs)")
+                    self.diagLock.lock()
+                    let qd = self.qDepthMax; let qa = self.qAgeMaxMs
+                    self.qDepthMax = 0; self.qAgeMaxMs = 0
+                    self.diagLock.unlock()
+                    logger.logDebug(String(format: "[hp-rtp] decrypted=%d hevc-decoded=%d droppedGappedAUs=%d qDepthMax=%d qAgeMaxMs=%.1f",
+                                           self.stats.decryptedCount, self.hevcFramesDecoded, self.hevcDroppedGappedAUs, qd, qa))
                 }
             }
         }
@@ -390,25 +504,64 @@ extension VNCConnection {
                 hevcDONL = detected
             }
             let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads, donl: hevcDONL)
-            let tile = tileIndex(for: au.ssrc)
-            // TEMP-MEASUREMENT: FIR→IDR recovery latency. Log when an IRAP (IDR/CRA/BLA, NAL types 16-23)
-            // AU arrives, incl. whether that recovery IDR itself came in gapped (→ FIR-loop failure mode).
-            if nals.contains(where: { AppleHEVCDepacketizer.nalType($0).map { (16...23).contains($0) } ?? false }) {
-                let fs = firSentNs
-                let sinceFirMs = fs > 0 ? Double(DispatchTime.now().uptimeNanoseconds &- fs) / 1e6 : -1
-                logger.logDebug(String(format: "[hp-idr] IRAP tile=%d hasGap=%@ sinceFIRms=%.0f", Int(tile), au.hasGap ? "Y" : "N", sinceFirMs))
+            let tile = tileIndex(for: au.ssrc, logger: logger)
+            // ltr_id = the tile-0 AU's first-packet 16-bit DONL, zero-extended (no transform); forwarded to
+            // the decode-success callback so a cleanly-decoded tile-0 frame can be ACKed.
+            let donl = AppleHEVCDepacketizer.firstDONL(au.orderedPayloads, donl: hevcDONL)
+
+            // [hp-idr]: IRAP cadence + FIR→IDR recovery latency. IRAP NAL types 16-21 (BLA 16-18, IDR 19-20,
+            // CRA 21). The win under motion = these lines COLLAPSE (LTR recovery is a small P-delta, not an
+            // IRAP); `hasGap=Y` on a recovery IRAP = a FIR-storm still present.
+            // TEMP-MEASUREMENT [hp-tile]: track per-SSRC NAL-type set + IRAP count (tile-independence probe).
+            do {
+                var set = tileTypeSets[au.ssrc] ?? []
+                let before = set.count
+                for n in nals { if let t = AppleHEVCDepacketizer.nalType(n) { set.insert(t) } }
+                if set.count != before {
+                    tileTypeSets[au.ssrc] = set
+                    logger.logDebug("[hp-tile] ssrc=\(au.ssrc & 0xFFFF) tile=\(tile) typesEverSeen=\(set.sorted()) (33=SPS 34=PPS 32=VPS 19/20=IDR 21=CRA <=31 VCL)")
+                }
+                if let it = nals.compactMap({ AppleHEVCDepacketizer.nalType($0) }).first(where: { AppleHEVCDepacketizer.isIRAP($0) }) {
+                    tileIRAPCounts[au.ssrc, default: 0] += 1
+                    if tileIRAPCounts[au.ssrc] == 1 {
+                        logger.logDebug("[hp-tile] ssrc=\(au.ssrc & 0xFFFF) tile=\(tile) FIRST-IRAP type=\(it)")
+                    }
+                }
             }
+            let irapType = nals.compactMap { AppleHEVCDepacketizer.nalType($0) }.first { AppleHEVCDepacketizer.isIRAP($0) }
+            if let irapType {
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                let sinceLastIRAPms = lastIRAPNs > 0 ? Double(nowNs &- lastIRAPNs) / 1e6 : -1
+                lastIRAPNs = nowNs
+                irapCount += 1
+                irapSinceLastOutput = true
+                diagLock.lock(); abIrap += 1; diagLock.unlock()
+                let fs = firSentNs
+                let sinceFirMs = fs > 0 ? Double(nowNs &- fs) / 1e6 : -1
+                let kind = (19...20).contains(irapType) ? "IDR" : (irapType == 21 ? "CRA" : "BLA")
+                logger.logDebug(String(format: "[hp-idr] IRAP tile=%d kind=%@ hasGap=%@ sinceLastIRAPms=%.0f irapCount=%d sinceFIRms=%.0f",
+                                       Int(tile), kind, au.hasGap ? "Y" : "N", sinceLastIRAPms, irapCount, sinceFirMs))
+            }
+
             if au.hasGap {
                 hevcDroppedGappedAUs += 1
-                // A dropped (gapped) AU breaks the HEVC reference chain → VT conceals every subsequent
-                // inter-coded AU until a clean IDR. Request an intra refresh NOW rather than waiting up to
-                // 2 s for the periodic keep-alive FIR (rate-limited inside).
+                diagLock.lock(); abGappedAU += 1; diagLock.unlock()
+                // The chain broke for this tile → CLEAR its chain-clean gate so we stop ACKing its LTR
+                // (never poison the server's LTR ring with a frame we didn't cleanly decode) until a clean
+                // IRAP re-roots it. Then request an intra refresh NOW (rate-limited) rather than waiting up
+                // to 2 s for the periodic keep-alive FIR.
+                chainClean[tile] = false
                 requestKeyframeOnLoss()
                 let params = nals.filter { (AppleHEVCDepacketizer.nalType($0)).map { !AppleHEVCDepacketizer.isVCL($0) } ?? false }
-                if !params.isEmpty { hevcDecoder.decode(nals: params, context: tile) }
+                if !params.isEmpty { hevcDecoder.decode(nals: params, context: tile, donl: nil) }
                 return
             }
-            hevcDecoder.decode(nals: nals, context: tile)
+
+            // A clean (non-gapped) tile-0 IRAP re-roots the shared decoder chain → it is now safe to ACK
+            // tile-0 LTRs (this frame + the clean P-deltas that follow). SET before decode so the IRAP's own
+            // inline `onFrame` ACKs it; a real decode error during it re-clears the gate via `onDecodeError`.
+            if tile == 0, irapType != nil { chainClean[0] = true }
+            hevcDecoder.decode(nals: nals, context: tile, donl: donl)
 #endif
         }
 
@@ -421,6 +574,7 @@ extension VNCConnection {
             let now = DispatchTime.now().uptimeNanoseconds
             guard now &- lastLossFirNs > 250_000_000 else { return }
             lastLossFirNs = now
+            firCount += 1   // [hp-stall] "firSentDuring" (video worker queue)
             firSentNs = now   // TEMP-MEASUREMENT: stamp FIR-send for FIR→IDR latency
             guard let protector = rtcpProtector else { return }   // keep-alive not up yet → periodic FIR covers it
             let ssrc = rtcpSenderSSRC
@@ -440,19 +594,45 @@ extension VNCConnection {
         /// the first frame or two) that steady state resolves to the reference's fixed map. When the app
         /// compositor lands it should freeze the map once `canvas.tileCount` distinct SSRCs are observed
         /// (and buffer/drop the first partial composite) rather than trust provisional early indices.
-        private func tileIndex(for ssrc: UInt32) -> UInt32 {
+        ///
+        /// **SSRC-GROUP ROTATION.** The daemon can retire a 4-SSRC group and start a fresh one mid-session —
+        /// notably right after a `0x1d` virtual display is created, where the reference observes TWO new groups
+        /// within ~2 s as the curtain engages. Without handling, every new SSRC would just be appended, so the
+        /// map would grow to 8 or 12 entries, tile indices would run past `tileCount`, strips would collapse to
+        /// 1/8th or 1/12th height, and the per-tile chain-clean / LTR-ACK state would be keyed to the wrong
+        /// tile. So once the map is full, an unknown SSRC is treated as a NEW GROUP: reset the map and the
+        /// per-tile decode state and start over. A ≥3 s coalescing guard (matching the reference) stops a
+        /// burst of new groups from thrashing the reset.
+        private func tileIndex(for ssrc: UInt32, logger: VNCLogger) -> UInt32 {
             if !hevcKnownSSRCs.contains(ssrc) {
+                let expected = expectedTileCount
+                if hevcKnownSSRCs.count >= expected {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if lastSSRCGroupResetNs == 0 || now &- lastSSRCGroupResetNs > 3_000_000_000 {
+                        lastSSRCGroupResetNs = now
+                        logger.logDebug("[hp-ssrc] new SSRC group (ssrc=\(ssrc & 0xFFFF) arrived with \(hevcKnownSSRCs.count)/\(expected) known) — resetting tile map + per-tile decode state")
+                        hevcKnownSSRCs.removeAll(keepingCapacity: true)
+                        hevcAssembler = AppleHEVCAccessUnitAssembler()
+                        chainClean.removeAll(keepingCapacity: true)
+                    } else {
+                        // Inside the coalescing window: ignore the extra group rather than thrash. The SSRC
+                        // still gets an index below (map has room only if the reset above ran).
+                        logger.logDebug("[hp-ssrc] extra SSRC \(ssrc & 0xFFFF) within 3s coalescing window — not resetting")
+                    }
+                }
                 hevcKnownSSRCs.append(ssrc)
                 hevcKnownSSRCs.sort()
             }
-            return UInt32(hevcKnownSSRCs.firstIndex(of: ssrc) ?? 0)
+            let idx = hevcKnownSSRCs.firstIndex(of: ssrc) ?? 0
+            // Clamp so a transient over-long map can never index past the canvas geometry.
+            return UInt32(min(idx, max(0, expectedTileCount - 1)))
         }
 
 #if canImport(VideoToolbox)
         /// Wire the decoder's output/error callbacks (frame counting + first-frame log + forward to the
         /// app render hook). Call once before the video socket starts delivering.
         func startHEVCDecode(logger: VNCLogger) {
-            hevcDecoder.onFrame = { [weak self] pixelBuffer, tile in
+            hevcDecoder.onFrame = { [weak self] pixelBuffer, tile, donl in
                 guard let self else { return }
                 self.hevcFramesDecoded += 1
                 if !self.hevcLoggedFirstFrame {
@@ -464,14 +644,132 @@ extension VNCConnection {
                     let fstr = String(bytes: f, encoding: .ascii) ?? String(fmt)
                     logger.logDebug("[hp-hevc] FIRST decoded frame \(w)x\(h) pixelFormat=\(fstr) hw=\(self.hevcDecoder.isHardwareAccelerated()) tile=\(tile)")
                 }
+                // Decoded output resumed — close any [hp-stall] flatline before delivering/ACKing.
+                self.noteDecodedOutput(logger: logger)
                 self.onDecodedVideoFrame?(pixelBuffer, tile)
+                // Decode-gated + chain-clean-gated LTR-ACK (the crux). Only tile-0; only while the chain is
+                // clean (§1.3b). `onFrame` firing alone is NOT a clean-decode signal (VT conceals with
+                // status==noErr) — the chain-clean gate is what prevents LTR-ack poisoning.
+                if tile == 0, let donl {
+                    if self.chainClean[0] == true {
+                        self.ltrAcksRequested += 1
+                        self.sendLTRAck(donl: donl, logger: logger)
+                    } else {
+                        self.ltrGateSkips += 1   // benign racy read on rtcpQueue for [hp-ltr]
+                    }
+                }
             }
             var loggedError = false
-            hevcDecoder.onDecodeError = { status in
-                if !loggedError { loggedError = true; logger.logDebug("[hp-hevc] first decode error OSStatus \(status) (VT conceals; continuing)") }
+            hevcDecoder.onDecodeError = { [weak self] status, tile in
+                guard let self else { return }
+                // A real (non-noErr) decode error means the chain broke for this tile → stop ACKing until a
+                // clean IRAP re-roots it (poisoning guard, §1.3b).
+                self.chainClean[tile] = false
+                if !loggedError { loggedError = true; logger.logDebug("[hp-hevc] first decode error OSStatus \(status) tile=\(tile) (VT conceals; continuing)") }
             }
         }
 #endif
+
+        /// [hp-stall]: called on every decoded output (video worker queue). If ≥ 500 ms elapsed since the
+        /// previous decoded frame (any tile), a freeze just ended — emit one line with the flatline duration
+        /// and the deltas accumulated over it, and fold the freeze time into the [hp-ab] rollup. `recoveredVia`
+        /// = IDR if an IRAP arrived during the flatline, else LTR if an LTR-ACK went out (P-delta recovery),
+        /// else a bare resume.
+        func noteDecodedOutput(logger: VNCLogger) {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if lastDecodedOutputNs != 0 {
+                let flatMs = Double(now &- lastDecodedOutputNs) / 1e6
+                if flatMs >= 500 {
+                    let gappedDuring = hevcDroppedGappedAUs - snapGappedAU
+                    let firDuring = firCount - snapFir
+                    let ltrDuring = ltrAcksRequested - snapLtrAck   // worker-local (no cross-queue race)
+                    let via = irapSinceLastOutput ? "IDR" : (ltrDuring > 0 ? "LTR" : "resume")
+                    logger.logDebug(String(format: "[hp-stall] flatlineMs=%.0f recoveredVia=%@ gappedAUduring=%d firSentDuring=%d ltrAcksDuring=%d",
+                                           flatMs, via, gappedDuring, firDuring, ltrDuring))
+                    diagLock.lock()
+                    abFreezeAccumMs += flatMs
+                    abFlatlines += 1
+                    if flatMs > abMaxFlatlineMs { abMaxFlatlineMs = flatMs }
+                    diagLock.unlock()
+                }
+            }
+            lastDecodedOutputNs = now
+            snapGappedAU = hevcDroppedGappedAUs
+            snapFir = firCount
+            snapLtrAck = ltrAcksRequested
+            irapSinceLastOutput = false
+        }
+
+        /// Send a decode-gated, chain-clean-gated LTR-ACK (Apple RTCP_APP PT204 subtype 5) on the VIDEO
+        /// socket (5901) so the encoder re-roots from a long-term reference (small P-delta) instead of a full
+        /// IDR on loss. `ltr_id` = the tile-0 AU's first-packet HEVC DONL, zero-extended (no transform).
+        /// REUSES the one existing SRTCP protector on `rtcpQueue` — a second protector would restart the
+        /// SRTCP index under the same key+SSRC → host replay-drop + CTR keystream reuse (NFR-6). Called from
+        /// the video worker queue inside the decode-success + chain-clean gate; the protect+send is dispatched
+        /// to `rtcpQueue` so the protector's monotonic index stays serialized with the keepalive/FIR.
+        func sendLTRAck(donl: UInt16, logger: VNCLogger) {
+            guard let protector = rtcpProtector else { return }   // keep-alive not up yet → nothing to reuse
+            let ssrc = rtcpSenderSSRC
+            let video = videoUDP
+            let ltrID = UInt32(donl)
+            rtcpQueue.async { [weak self] in
+                guard let self else { return }
+                // Dedupe on `!=` (not `>`) so ACKs resume after the 16-bit DONL wraps (~18 min @60fps).
+                if self.lastAckedDONL == donl { self.ltrDupSuppressed += 1; return }
+                self.lastAckedDONL = donl
+                guard let pkt = try? protector.protect(AppleRTCPBuilders.appLtrAck(sender: ssrc, ltrID: ltrID)) else { return }
+                video.send(pkt)
+                self.ltrAckCount += 1
+                self.ltrLastID = ltrID
+                self.diagLock.lock(); self.abLtrAck += 1; self.diagLock.unlock()
+
+                // FIRST-send line ONCE — the crux egress proof: localPort MUST be 5901, and `donlOnWire`
+                // (the 16-bit value read off the wire) MUST equal `ltrID & 0xFFFF` (proves the id is the real
+                // payload DONL, not a POC/ordinal — the silent-no-op regression). Never logs key/IV/salt (a
+                // DONL is a public frame counter, safe).
+                if !self.ltrLoggedFirst {
+                    self.ltrLoggedFirst = true
+                    let match = UInt16(truncatingIfNeeded: ltrID) == donl
+                    logger.logDebug("[hp-ltr] FIRST ltrID=\(ltrID) tile=0 socket=video localPort=\(video.localPort) senderSSRC=\(ssrc & 0xFFFF) donlOnWire=\(donl) match=\(match)")
+                }
+                // 1/s aggregate (the raw ACK fires at frame rate — NEVER log per-ACK). `dDONL == 0` with
+                // acks/s > 0 = FAIL (silent no-op / non-advancing id).
+                let now = DispatchTime.now().uptimeNanoseconds
+                if self.ltrWinStartNs == 0 { self.ltrWinStartNs = now; self.ltrPrevID = ltrID }
+                let elapsed = now &- self.ltrWinStartNs
+                if elapsed >= 1_000_000_000 {
+                    let dDONL = Int(self.ltrLastID) - Int(self.ltrPrevID)
+                    logger.logDebug(String(format: "[hp-ltr] acks/s=%.0f lastLtrID=%d dDONL=%d dupSuppressed=%d gateSkips=%d",
+                                           Double(self.ltrAckCount) / (Double(elapsed) / 1e9), self.ltrLastID, dDONL,
+                                           self.ltrDupSuppressed, self.ltrGateSkips))
+                    self.ltrWinStartNs = now; self.ltrAckCount = 0; self.ltrDupSuppressed = 0; self.ltrPrevID = self.ltrLastID
+                }
+            }
+        }
+
+        /// [hp-ab]: the one line that proves the fix. `freezeSecPerMin` = cumulative decoded-output flatline
+        /// time over the window, normalized to 60 s (target ≈ 0 for the 4-tile+LTR build). Emitted every 10 s
+        /// off the rtcp timer and once on teardown, under `diagLock` so the cross-queue accumulators are
+        /// read+reset atomically.
+        func logABSummary(logger: VNCLogger, reason: String) {
+            let now = DispatchTime.now().uptimeNanoseconds
+            diagLock.lock()
+            let windowNs = abWinStartNs > 0 ? (now &- abWinStartNs) : 0
+            let windowS = max(Double(windowNs) / 1e9, 0.001)
+            let freezeSecPerMin = (abFreezeAccumMs / 1000.0) / windowS * 60.0
+            let flatlinesPerMin = Double(abFlatlines) / windowS * 60.0
+            let maxFlat = abMaxFlatlineMs
+            let irapPerMin = Double(abIrap) / windowS * 60.0
+            let ltrPerMin = Double(abLtrAck) / windowS * 60.0
+            let gappedPerMin = Double(abGappedAU) / windowS * 60.0
+            let qdMax = abQDepthMax
+            abWinStartNs = now
+            abFreezeAccumMs = 0; abFlatlines = 0; abMaxFlatlineMs = 0
+            abIrap = 0; abLtrAck = 0; abGappedAU = 0; abQDepthMax = 0
+            diagLock.unlock()
+            logger.logDebug(String(format: "[hp-ab] (%@ %.1fs) freezeSecPerMin=%.2f flatlines/min=%.1f maxFlatlineMs=%.0f irap/min=%.1f ltrAck/min=%.0f gappedAU/min=%.1f qDepthMax=%d",
+                                   reason, windowS, freezeSecPerMin, flatlinesPerMin, maxFlat, irapPerMin, ltrPerMin, gappedPerMin, qdMax))
+        }
 
         /// Start the 0.5 s RTCP TX keep-alive out the ctrl socket (crib §4g): SRTCP-protected empty RR
         /// each tick + empty SR every 5 s + a legacy-FIR (PT=192) periodically. Keeps AVConference
@@ -484,6 +782,8 @@ extension VNCConnection {
             // Share the protector + sender SSRC with the on-demand loss-recovery FIR (both send via rtcpQueue).
             self.rtcpProtector = protector
             self.rtcpSenderSSRC = senderSSRC
+            self.diagLogger = logger
+            self.abWinStartNs = DispatchTime.now().uptimeNanoseconds   // start the [hp-ab] window
             let ctrl = ctrlUDP
             let timer = DispatchSource.makeTimerSource(queue: rtcpQueue)
             timer.schedule(deadline: .now() + 0.5, repeating: .milliseconds(500))
@@ -508,6 +808,9 @@ extension VNCConnection {
                         ctrl.send(fir)
                     }
                 }
+                // [hp-ab] freeze/recovery summary every 10 s (tick runs on rtcpQueue — same queue that reads
+                // the diagLock-guarded AB accumulators).
+                if tick % 20 == 0 { self?.logABSummary(logger: logger, reason: "10s") }
             }
             rtcpTimer = timer
             timer.resume()
@@ -515,6 +818,7 @@ extension VNCConnection {
         }
 
         func cancel() {
+            if let diagLogger { logABSummary(logger: diagLogger, reason: "teardown") }
             rtcpTimer?.cancel()
             rtcpTimer = nil
             videoUDP.cancel()

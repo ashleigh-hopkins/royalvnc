@@ -96,6 +96,20 @@ enum AppleHEVCDepacketizer {
         return nals
     }
 
+    /// The 16-bit big-endian DONL of the FIRST packet of an access unit (decode-order), or `nil` when the
+    /// stream carries no DONL (`donl == false`) or the payload is too short. Mirrors the reference
+    /// `nalu.first_donl`: the DONL sits at the same offset the depay layout skips — FU (type 49) →
+    /// `FUhdr[2]+FUheader[1]` so DONL is at offset **3**; AP (48) / single-NAL → `hdr[2]` so DONL is at
+    /// offset **2**. Used to derive the LTR-ACK id (ltr_id = tile-0 AU's first-packet DONL, zero-extended).
+    static func firstDONL(_ orderedPayloads: [Data], donl: Bool) -> UInt16? {
+        guard donl, let first = orderedPayloads.first else { return nil }
+        let b = [UInt8](first)
+        guard b.count >= 2, let type = nalType(first) else { return nil }
+        let donlOffset = (type == nalTypeFragmentationUnit) ? 3 : 2
+        guard b.count >= donlOffset + 2 else { return nil }
+        return (UInt16(b[donlOffset]) << 8) | UInt16(b[donlOffset + 1])
+    }
+
     /// Detect whether Apple's 16-bit DONL is present, from an Aggregation Packet (the parameter-set AP).
     /// No-DONL layout is `APhdr[2] | size[2] | NAL…`; if that size fits and the first NAL is a parameter-set
     /// type (VPS/SPS/PPS), DONL is absent. Otherwise assume present (the 4-tile default). Returns `nil` if

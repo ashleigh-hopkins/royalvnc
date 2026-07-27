@@ -18,17 +18,22 @@ import CoreVideo
 /// with `nalUnitHeaderLength=4` → one HW-preferred session → 4-byte-length-prefixed sample buffers → sync
 /// output handler) mirrors the HP B1/B2 probes; original code, no AGPL copied.
 ///
-/// Threading: `decode(nals:context:)` is called from a single serial queue (the media decode worker).
-/// Decode is ASYNCHRONOUS (`kVTDecodeFrame_EnableAsynchronousDecompression`): the feed returns without
-/// waiting for the HW round-trip, and `onFrame` fires later on VideoToolbox's own output thread (not the
-/// caller's queue). Frames are still decoded in submission order (cross-tile refs / shared DPB preserved).
+/// Threading: `decode(nals:context:donl:)` is called from a single serial queue (the media decode worker).
+/// Decode is SYNCHRONOUS (`VTDecompressionSessionDecodeFrame` flags `[]`): the output handler fires INLINE
+/// on the caller's queue before `feed()` returns, in strict FIFO decode order (cross-tile refs / shared DPB
+/// preserved). Async decode was tried for throughput but WEDGED under FMV on A18 (see `feed`). Because
+/// decode is synchronous, the per-`feed` `donl` captured for the LTR-ACK is unambiguously the DONL of the
+/// frame that `onFrame` emits — no `ts→DONL` side-map is needed. If VT is ever reconfigured async, that
+/// association breaks and the DONL would need a ts-keyed map instead.
 /// Not thread-safe for concurrent callers by design (one queue submits; VT serializes output).
 final class AppleHEVCDecoder {
-    /// Called with each decoded frame and the caller's `context` tag (the tile index). Fires on the
-    /// calling queue, in decode order.
-    var onFrame: ((CVPixelBuffer, UInt32) -> Void)?
-    /// Called with the first non-`noErr` decode/feed status (throttling is the caller's concern).
-    var onDecodeError: ((OSStatus) -> Void)?
+    /// Called with each decoded frame, the caller's `context` tag (the tile index), and the tile-0 AU's
+    /// first-packet DONL (`nil` when the stream carries no DONL or for a params-only feed). Fires INLINE on
+    /// the calling queue, in decode order. The `donl` lets the caller send a decode-gated LTR-ACK.
+    var onFrame: ((CVPixelBuffer, UInt32, UInt16?) -> Void)?
+    /// Called with the first non-`noErr` decode/feed status and the tile `context` it occurred on
+    /// (throttling is the caller's concern). The context lets the caller clear the per-tile chain-clean gate.
+    var onDecodeError: ((OSStatus, UInt32) -> Void)?
 
     private let requireHardware: Bool
 
@@ -45,6 +50,27 @@ final class AppleHEVCDecoder {
     private var builtSignature: Data?
 
     private var diagCount = 0   // TEMP: single-tile decode diagnosis (not DEBUG-guarded; harness builds release)
+
+    // TEMP-MEASUREMENT [hp-split]: decompose the per-AU cost that `[hp-prof] decodeMs` lumps together.
+    // The inline VT completion handler runs INSIDE VTDecompressionSessionDecodeFrame, so the only way to
+    // separate real HW decode from the downstream callback (app composite + LTR-ACK) is to time the handler
+    // and subtract it from the decode call's span. Resolves: is the ceiling HW compute, blocked wait, or
+    // inline callback work? Read+reset by the media receiver once per second.
+    private(set) var probeSignatureNs: UInt64 = 0    // harvest + per-AU param signature build/compare
+    private(set) var probeSampleBuildNs: UInt64 = 0  // makeSampleBuffer (malloc + memcpy + CoreMedia objects)
+    private(set) var probeVTNs: UInt64 = 0           // decode call span MINUS the inline callback = real VT
+    private(set) var probeCallbackNs: UInt64 = 0     // inline onFrame (app composite/coalesce + LTR-ACK)
+    private(set) var probeFeeds = 0                  // VCL NALs fed
+    private(set) var probeAUs = 0                    // decode() calls
+
+    /// Read + zero the [hp-split] accumulators (called on the media worker queue, same queue as `decode`).
+    func takeProbe() -> (sigNs: UInt64, buildNs: UInt64, vtNs: UInt64, cbNs: UInt64, feeds: Int, aus: Int) {
+        defer {
+            probeSignatureNs = 0; probeSampleBuildNs = 0; probeVTNs = 0; probeCallbackNs = 0
+            probeFeeds = 0; probeAUs = 0
+        }
+        return (probeSignatureNs, probeSampleBuildNs, probeVTNs, probeCallbackNs, probeFeeds, probeAUs)
+    }
     private(set) var framesDecoded = 0
     private(set) var decodeErrors = 0
     private(set) var negotiatedPixelFormat: OSType?
@@ -69,10 +95,14 @@ final class AppleHEVCDecoder {
 
     /// Decode one access unit's NAL units (already depayed, in decode order) for `context` (tile index).
     /// Harvests any parameter sets first (rebuilding the session on a real change), then feeds the VCL
-    /// slices. No-ops until a full VPS+SPS+PPS set has been seen.
-    func decode(nals: [Data], context: UInt32) {
+    /// slices. No-ops until a full VPS+SPS+PPS set has been seen. `donl` = the AU's first-packet DONL,
+    /// forwarded to `onFrame` (for the LTR-ACK); `nil` for a params-only feed.
+    func decode(nals: [Data], context: UInt32, donl: UInt16? = nil) {
+        let tSig0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT [hp-split]
         harvestParameterSets(nals)
-        rebuildIfParametersChanged()
+        rebuildIfParametersChanged(context: context)
+        probeSignatureNs &+= DispatchTime.now().uptimeNanoseconds &- tSig0
+        probeAUs += 1
 
         if diagCount < 60 {
             diagCount += 1
@@ -89,7 +119,7 @@ final class AppleHEVCDecoder {
             guard let type = AppleHEVCDepacketizer.nalType(nal), AppleHEVCDepacketizer.isVCL(type) else {
                 continue   // VPS/SPS/PPS/SEI come from the format description, never fed as samples
             }
-            feed(nal: nal, session: session, format: formatDescription, context: context)
+            feed(nal: nal, session: session, format: formatDescription, context: context, donl: donl)
         }
     }
 
@@ -119,7 +149,7 @@ final class AppleHEVCDecoder {
 
     /// (Re)build the format description + session when the harvested parameter sets change. Identical
     /// resends are no-ops (DPB-preserving).
-    private func rebuildIfParametersChanged() {
+    private func rebuildIfParametersChanged(context: UInt32) {
         guard let sig = currentSignature(), sig != builtSignature else { return }
         guard let vps, let sps else { return }
 
@@ -140,7 +170,7 @@ final class AppleHEVCDecoder {
             }
         }
         guard createStatus == noErr, let fmt = newFormat else {
-            onDecodeError?(createStatus)
+            onDecodeError?(createStatus, context)
             return
         }
 
@@ -181,7 +211,7 @@ final class AppleHEVCDecoder {
             decompressionSessionOut: &newSession)
 
         guard sessionStatus == noErr, let created = newSession else {
-            onDecodeError?(sessionStatus)
+            onDecodeError?(sessionStatus, context)
             return
         }
 
@@ -192,11 +222,18 @@ final class AppleHEVCDecoder {
 
     // MARK: - Feeding
 
-    private func feed(nal: Data, session: VTDecompressionSession, format: CMFormatDescription, context: UInt32) {
+    private func feed(nal: Data, session: VTDecompressionSession, format: CMFormatDescription, context: UInt32, donl: UInt16?) {
+        let tBuild0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT [hp-split]
         guard let sample = makeSampleBuffer(nal: nal, format: format) else {
-            recordError(noErr)
+            recordError(noErr, context: context)
             return
         }
+        probeSampleBuildNs &+= DispatchTime.now().uptimeNanoseconds &- tBuild0
+        probeFeeds += 1
+        // The completion handler fires INLINE inside the decode call below; accumulate its own span here so
+        // it can be subtracted → probeVTNs = real HW decode, probeCallbackNs = downstream inline work.
+        var callbackNs: UInt64 = 0
+        let tDec0 = DispatchTime.now().uptimeNanoseconds
         // SYNCHRONOUS decode (flags: []): the output handler fires inline before this returns, so decode
         // never falls behind its own feed. Async decode (`kVTDecodeFrame_EnableAsynchronousDecompression`)
         // was tried for throughput but WEDGED under FMV load on A18 — large frames fed at high rate into the
@@ -208,22 +245,28 @@ final class AppleHEVCDecoder {
             session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
         ) { [weak self] status, _, imageBuffer, _, _ in
             guard let self else { return }
+            let tCb0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT [hp-split]
+            defer { callbackNs &+= DispatchTime.now().uptimeNanoseconds &- tCb0 }
             if status == noErr, let imageBuffer {
                 self.framesDecoded += 1
                 if self.negotiatedPixelFormat == nil {
                     self.negotiatedPixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer)
                 }
-                self.onFrame?(imageBuffer, context)
+                self.onFrame?(imageBuffer, context, donl)
             } else {
-                self.recordError(status)
+                self.recordError(status, context: context)
             }
         }
-        if status != noErr { recordError(status) }
+        // TEMP-MEASUREMENT [hp-split]: decode-call span minus the inline callback = real VT decode cost.
+        let span = DispatchTime.now().uptimeNanoseconds &- tDec0
+        probeVTNs &+= span > callbackNs ? (span &- callbackNs) : 0
+        probeCallbackNs &+= callbackNs
+        if status != noErr { recordError(status, context: context) }
     }
 
-    private func recordError(_ status: OSStatus) {
+    private func recordError(_ status: OSStatus, context: UInt32) {
         decodeErrors += 1
-        onDecodeError?(status)
+        onDecodeError?(status, context)
     }
 
     /// Wrap a NAL as a 4-byte-BE length-prefixed (AVCC, matches `nalUnitHeaderLength=4`) sample buffer.
