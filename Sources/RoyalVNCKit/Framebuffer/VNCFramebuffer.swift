@@ -221,7 +221,10 @@ public extension VNCFramebuffer {
         
         if let ioSurfaceAllocator = self.allocator as? VNCFramebufferIOSurfaceAllocator,
            let surface = ioSurfaceAllocator.surface {
-            image = .init(ioSurface: surface,
+            // Mac Catalyst / macOS: CIImage(ioSurface:) takes IOSurfaceRef (toll-free
+            // bridged), whereas the iOS SDK takes the IOSurface class. Bridge explicitly
+            // so the call type-checks on both SDK variants.
+            image = .init(ioSurface: unsafeBitCast(surface, to: IOSurfaceRef.self),
                           options: ciImageOptions)
         } else {
             let data = Data(bytes: surfaceAddress,
