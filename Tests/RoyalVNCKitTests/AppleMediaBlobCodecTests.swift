@@ -123,6 +123,66 @@ final class AppleMediaBlobCodecTests: XCTestCase {
         XCTAssertEqual(rei, hex("080010011a0747656e657269632205312e302e302a0130"))
     }
 
+    // MARK: - field 9 tier pruning (T21 bitrate experiment)
+
+    /// The default MUST stay byte-identical to the capture: this table is inherited wire bytes, and the
+    /// experiment is only meaningful if the baseline is the unmodified offer.
+    func testDefaultTierTableIsTheVerbatimCapture() {
+        XCTAssertEqual(AppleMediaBlobCodec.bandwidthTiers(minBitrate: 0),
+                       AppleMediaBlobCodec.appleAudioF9)
+        XCTAssertEqual(AppleMediaBlobCodec.bandwidthTiers(minBitrate: 0).count,
+                       AppleMediaBlobCodec.appleAudioF9.count)
+    }
+
+    /// Pruning at 60 Mbps must keep exactly the 60/75/100 M rungs plus all four non-rate entries, and drop
+    /// the 6/20/40 M ones — dropping the small odd entries too would change more than one variable.
+    func testTierPruningKeepsHighRungsAndAllNonRateEntries() {
+        let pruned = AppleMediaBlobCodec.bandwidthTiers(minBitrate: 60_000_000)
+        let kept = Self.decodeTiers(pruned)
+
+        let rateRungs = kept.filter { $0.f1 == 0 && $0.f2 >= 1_000_000 }.map(\.f2).sorted()
+        XCTAssertEqual(rateRungs, [60_000_000, 75_000_000, 100_000_000])
+
+        // The four odd entries survive untouched.
+        let others = kept.filter { !($0.f1 == 0 && $0.f2 >= 1_000_000) }
+        XCTAssertEqual(others.count, 4, "the non-rate entries must all be kept")
+        XCTAssertTrue(others.contains { $0.f1 == 4074 && $0.f2 == 0 })
+        XCTAssertTrue(others.contains { $0.f1 == 16 && $0.f2 == 4100 })
+        XCTAssertTrue(others.contains { $0.f1 == 4 && $0.f2 == 6500 })
+        XCTAssertTrue(others.contains { $0.f1 == 1 && $0.f2 == 299 })
+    }
+
+    /// A floor above every rung leaves only the non-rate entries — the extreme of the sweep.
+    func testTierPruningAboveEveryRungKeepsOnlyNonRateEntries() {
+        let kept = Self.decodeTiers(AppleMediaBlobCodec.bandwidthTiers(minBitrate: 200_000_000))
+        XCTAssertEqual(kept.count, 4)
+        XCTAssertFalse(kept.contains { $0.f1 == 0 && $0.f2 >= 1_000_000 })
+    }
+
+    /// Decode the `field 9` entries back out of the encoded table.
+    private static func decodeTiers(_ bytes: [UInt8]) -> [(f1: UInt64, f2: UInt64)] {
+        var out: [(f1: UInt64, f2: UInt64)] = []
+        var pos = 0
+        while pos < bytes.count {
+            guard let (tag, afterTag) = AppleMediaBlobCodec.readVarint(bytes, pos),
+                  tag == UInt64((9 << 3) | 2),
+                  let (len, afterLen) = AppleMediaBlobCodec.readVarint(bytes, afterTag) else { break }
+            let body = Array(bytes[afterLen..<(afterLen + Int(len))])
+            pos = afterLen + Int(len)
+
+            var f1: UInt64 = 0, f2: UInt64 = 0, p = 0
+            while p < body.count {
+                guard let (t, aT) = AppleMediaBlobCodec.readVarint(body, p),
+                      let (v, aV) = AppleMediaBlobCodec.readVarint(body, aT) else { break }
+                if t >> 3 == 1 { f1 = v }
+                if t >> 3 == 2 { f2 = v }
+                p = aV
+            }
+            out.append((f1: f1, f2: f2))
+        }
+        return out
+    }
+
     func testFieldEncoders() {
         // field 16, varint 0 → tag 128 (0x80 0x01) ‖ 0x00.
         XCTAssertEqual(AppleMediaBlobCodec.fieldVarint(16, 0), [0x80, 0x01, 0x00])

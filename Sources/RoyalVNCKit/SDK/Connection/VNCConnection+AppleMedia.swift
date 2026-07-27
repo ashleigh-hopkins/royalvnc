@@ -63,7 +63,7 @@ extension VNCConnection {
         // defaults tilesPerFrame:4/codec:.both/ltrpEnabled:true — blob fields 2 & 7 carry the LTRP flag.)
         let config = Apple0x1cOffer.Config(
             flags: .standard,
-            blob: .init(tilesPerFrame: 4),
+            blob: .init(tilesPerFrame: 4, minBandwidthTierBitrate: settings.highPerformanceMinBandwidthTier),
             remoteEndpointInfo: AppleMediaBlobCodec.buildRemoteEndpointInfo(hwModel: "Mac", avcVersion: "1.0.0", osBuild: "0"))
 
         let offer = try Apple0x1cOffer.build(config: config, params: params)

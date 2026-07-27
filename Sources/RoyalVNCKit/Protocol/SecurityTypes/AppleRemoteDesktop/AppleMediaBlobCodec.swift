@@ -33,15 +33,25 @@ enum AppleMediaBlobCodec {
         var ltrpEnabled: Bool
         /// The `field 6` product string. Live-pin whether the host validates it (spec §11 R6).
         var productString: String
+        /// EXPERIMENT (T21): drop `field 9` tiers whose `f2` is a nonzero value BELOW this, so only the
+        /// high rungs are offered. `0` (default) sends the table verbatim — byte-identical to the capture.
+        ///
+        /// The `field 9` table is the best bitrate-adjacent structure in the offer (see `audioF9Tiers`),
+        /// and the measured ~22–24 Mbps stream ceiling sits right next to its 20 Mbps rung. If the host
+        /// picks a rung, removing the low ones should move the ceiling; if the stream is unchanged, `field
+        /// 9` is eliminated and the search moves to the per-rule `formats` mask / `f5.3.4`.
+        var minBandwidthTierBitrate: UInt64
 
         init(tilesPerFrame: Int = 4,
              codec: VideoCodec = .both,
              ltrpEnabled: Bool = true,
-             productString: String = "iShareScreen 1.0") {
+             productString: String = "iShareScreen 1.0",
+             minBandwidthTierBitrate: UInt64 = 0) {
             self.tilesPerFrame = tilesPerFrame
             self.codec = codec
             self.ltrpEnabled = ltrpEnabled
             self.productString = productString
+            self.minBandwidthTierBitrate = minBandwidthTierBitrate
         }
     }
 
@@ -138,7 +148,8 @@ enum AppleMediaBlobCodec {
             + fieldVarint(8, 63) + fieldVarint(9, 1) + fieldVarint(12, 1)
 
         return buildOuter(descField: fieldBytes(5, desc),
-                          productString: config.productString, timestamp: timestamp)
+                          productString: config.productString, timestamp: timestamp,
+                          minBandwidthTierBitrate: config.minBandwidthTierBitrate)
     }
 
     /// Build the audio (mode 8) MediaBlob protobuf (uncompressed). `sessionID` is our audio SSRC.
@@ -147,31 +158,46 @@ enum AppleMediaBlobCodec {
             + fieldVarint(3, 0) + fieldVarint(4, 24191)
             + fieldVarint(5, 0) + fieldVarint(6, 0)
         return buildOuter(descField: fieldBytes(3, desc),
-                          productString: config.productString, timestamp: timestamp)
+                          productString: config.productString, timestamp: timestamp,
+                          minBandwidthTierBitrate: config.minBandwidthTierBitrate)
     }
 
     /// The shared outer MediaBlob wrapper (identical for video/audio; only `descField` differs).
-    private static func buildOuter(descField: [UInt8], productString: String, timestamp: UInt64) -> Data {
+    private static func buildOuter(descField: [UInt8],
+                                   productString: String,
+                                   timestamp: UInt64,
+                                   minBandwidthTierBitrate: UInt64 = 0) -> Data {
         var out = fieldVarint(1, 1) + fieldVarint(2, 1)
         out += descField
         out += fieldBytes(6, Array(productString.utf8))
         out += fieldVarint(8, 0)
-        out += appleAudioF9
+        out += minBandwidthTierBitrate == 0 ? appleAudioF9 : bandwidthTiers(minBitrate: minBandwidthTierBitrate)
         out += fieldVarint(13, timestamp)
         out += fieldVarint(14, 2) + fieldVarint(16, 0) + fieldVarint(18, 1)
         return Data(out)
     }
 
-    /// The verbatim `field 9` audio tier list, built once.
-    static let appleAudioF9: [UInt8] = {
+    /// The verbatim `field 9` tier list, built once (`minBitrate: 0`).
+    static let appleAudioF9: [UInt8] = bandwidthTiers(minBitrate: 0)
+
+    /// Encode the `field 9` tier table, optionally dropping the low rungs (T21 experiment — see
+    /// `Config.minBandwidthTierBitrate`). `minBitrate: 0` reproduces the captured bytes exactly.
+    ///
+    /// Only `(f1 == 0, f2 >= 1_000_000)` entries are treated as rate rungs; the four small/odd entries
+    /// (`4074,0,16384` / `16,4100` / `4,6500` / `1,299`) are always kept, since their shape says they are
+    /// a different kind of parameter and dropping them would change more than one variable at a time.
+    static func bandwidthTiers(minBitrate: UInt64) -> [UInt8] {
         var out = [UInt8]()
         for tier in audioF9Tiers {
+            let isRateRung = tier.f1 == 0 && tier.f2 >= 1_000_000
+            if isRateRung, minBitrate > 0, tier.f2 < minBitrate { continue }
+
             var body = fieldVarint(1, tier.f1) + fieldVarint(2, tier.f2)
             if let f3 = tier.f3 { body += fieldVarint(3, f3) }
             out += fieldBytes(9, body)
         }
         return out
-    }()
+    }
 
     // MARK: - RemoteEndpointInfo (crib §1c)
 

@@ -118,6 +118,15 @@ public extension VNCConnection {
 		/// `0x1c` HEVC bank.
 		public let highPerformanceRequestedBitrate: UInt64
 
+		/// EXPERIMENT (T21): if non-zero, prune the `0x1c` offer's `field 9` tier table to rungs at or above
+		/// this bitrate (bits/s). `0` (default) sends the captured table verbatim.
+		///
+		/// `field 9` is a 10-entry table we send in both the video and audio MediaBlobs, inherited from a
+		/// capture and labelled a guess ("audio config"). Decoded it looks like a rate ladder — six
+		/// `(0, rate, size)` rungs spanning 6–100 Mbps — and the measured ~22–24 Mbps stream ceiling sits next
+		/// to its 20 Mbps rung. If the host selects a rung, dropping the low ones should move the ceiling.
+		public let highPerformanceMinBandwidthTier: UInt64
+
 		/// Default: **0 — send no TMMBR**, because the host was measured ignoring it (see above). 60 Mbps is
 		/// the value the probe used if you want to reproduce that measurement.
 		public static let defaultRequestedBitrate: UInt64 = 0
@@ -145,7 +154,8 @@ public extension VNCConnection {
 					useOptimisticContinuousUpdates: Bool = false,
 					enableHighPerformance: Bool = false,
 					highPerformanceDisplay: HighPerformanceDisplay? = nil,
-					highPerformanceRequestedBitrate: UInt64 = Settings.defaultRequestedBitrate) {
+					highPerformanceRequestedBitrate: UInt64 = Settings.defaultRequestedBitrate,
+					highPerformanceMinBandwidthTier: UInt64 = 0) {
 			self.isDebugLoggingEnabled = isDebugLoggingEnabled
 
 			self.hostname = hostname
@@ -170,6 +180,7 @@ public extension VNCConnection {
 			self.enableHighPerformance = enableHighPerformance
 			self.highPerformanceDisplay = highPerformanceDisplay
 			self.highPerformanceRequestedBitrate = highPerformanceRequestedBitrate
+			self.highPerformanceMinBandwidthTier = highPerformanceMinBandwidthTier
 		}
 
 #if canImport(ObjectiveC)
