@@ -100,6 +100,22 @@ public extension VNCConnection {
 		/// `enableHighPerformance` is `true`. Connect-time only.
 		public let highPerformanceDisplay: HighPerformanceDisplay?
 
+		/// Bitrate to request from the host over RTCP **TMMBR** (RFC 5104), in bits per second. `0` disables
+		/// the request entirely (nothing extra goes on the wire).
+		///
+		/// PROBE. `screensharingd` was measured sending roughly the same total bitrate (~15 Mbps) regardless
+		/// of canvas size — 1920×1080, 2868×1320 and 3840×2160 all landed within a few Mbps — so a larger
+		/// virtual display spreads the same bits over more pixels and the picture goes blocky, worst of all
+		/// when zoomed. The client has never expressed a bandwidth preference (RR/SR/FIR/PLI/NACK say nothing
+		/// about it), so if AVConference sizes its encoder from receiver-side signalling it has never heard
+		/// from us. Whether Apple honours TMMBR is unknown and this is how we find out: watch `pktsPerAU` in
+		/// the `[hp-prof]` line. Ignored unless `enableHighPerformance` is `true`.
+		public let highPerformanceRequestedBitrate: UInt64
+
+		/// Default TMMBR request: 60 Mbps. Comfortably above the observed ~15 Mbps so any honouring of the
+		/// request is unmistakable, while staying plausible for a LAN/Wi-Fi link.
+		public static let defaultRequestedBitrate: UInt64 = 60_000_000
+
 #if canImport(ObjectiveC)
 		@objc(frameEncodings)
 #endif
@@ -122,7 +138,8 @@ public extension VNCConnection {
 					useContinuousUpdates: Bool = false,
 					useOptimisticContinuousUpdates: Bool = false,
 					enableHighPerformance: Bool = false,
-					highPerformanceDisplay: HighPerformanceDisplay? = nil) {
+					highPerformanceDisplay: HighPerformanceDisplay? = nil,
+					highPerformanceRequestedBitrate: UInt64 = Settings.defaultRequestedBitrate) {
 			self.isDebugLoggingEnabled = isDebugLoggingEnabled
 
 			self.hostname = hostname
@@ -146,6 +163,7 @@ public extension VNCConnection {
 			self.useOptimisticContinuousUpdates = useOptimisticContinuousUpdates
 			self.enableHighPerformance = enableHighPerformance
 			self.highPerformanceDisplay = highPerformanceDisplay
+			self.highPerformanceRequestedBitrate = highPerformanceRequestedBitrate
 		}
 
 #if canImport(ObjectiveC)

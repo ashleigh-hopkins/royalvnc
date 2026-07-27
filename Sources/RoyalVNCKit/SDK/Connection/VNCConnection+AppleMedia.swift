@@ -150,6 +150,8 @@ extension VNCConnection {
                 // Bound the SSRC→tile map to the negotiated geometry (guards mid-session SSRC-group rotation,
                 // which the reference observes right after a 0x1d virtual display is created).
                 if canvas.tileCount > 0 { media.expectedTileCount = Int(canvas.tileCount) }
+                // Must be set BEFORE the keep-alive timer starts — that timer is the only reader.
+                media.tmmbrBitsPerSecond = settings.highPerformanceRequestedBitrate
                 media.startRTCPKeepAlive(videoKeyV: vkv, senderSSRC: ssrcs?.video ?? 0, logger: logger)
                 #if canImport(VideoToolbox)
                 media.onDecodedVideoFrame = appleHPDecodedVideoFrameHandler
@@ -435,6 +437,10 @@ extension VNCConnection {
         /// a mid-session SSRC-group rotation can't inflate tile indices past the geometry. Defaults to the
         /// 4-tile offer we send.
         var expectedTileCount = 4
+        /// Bitrate (bits/s) to request from the host via periodic RTCP TMMBR; `0` sends none. Set from
+        /// `Settings.highPerformanceRequestedBitrate` when negotiation completes — see the TMMBR probe note in
+        /// `startRTCPKeepAlive`. Written once before the keep-alive timer starts, read only on `rtcpQueue`.
+        var tmmbrBitsPerSecond: UInt64 = 0
         /// AUs dropped because their SSRC had no tile slot. Non-zero means an extra SSRC group is live.
         var ssrcUnmappedDrops: Int { tileMap.unmappedDrops }
         /// TEMP-MEASUREMENT ([hp-tile]): per-SSRC set of HEVC NAL types EVER seen — decisive for tile
@@ -904,6 +910,26 @@ extension VNCConnection {
                                                          payload: AppleRTCPBuilders.firLegacy(target: senderSSRC))) {
                         self?.firSentNs = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
                         ctrl.send(fir)
+                    }
+                }
+                // TMMBR bitrate probe (PT=205 FMT=3) every 2 s, offset from the FIR tick so the two are not
+                // in the same datagram burst.
+                //
+                // WHY: the host sends ~15 Mbps regardless of canvas size (measured across 1920x1080,
+                // 2868x1320 and 3840x2160), so a larger virtual display just spreads the same bits thinner
+                // and goes blocky. We have never told it we can take more — RR/SR/FIR/PLI/NACK say nothing
+                // about bandwidth. This asks. It is a PROBE: if `pktsPerAU` in [hp-prof] does not move, Apple
+                // ignores TMMBR and the bitrate lever is elsewhere (the 0x1c HEVC bank's res/params fields).
+                if tick % 4 == 2, let requested = self?.tmmbrBitsPerSecond, requested > 0 {
+                    if let tmmbr = try? protector.protect(
+                        AppleRTCPBuilders.compoundWithRR(sender: senderSSRC,
+                                                         payload: AppleRTCPBuilders.tmmbr(sender: senderSSRC,
+                                                                                          target: senderSSRC,
+                                                                                          bitsPerSecond: requested))) {
+                        ctrl.send(tmmbr)
+                        if tick == 2 {
+                            logger.logDebug("[hp-tmmbr] requesting \(requested / 1_000_000) Mbps via TMMBR (PT205 FMT3) every 2s — watch pktsPerAU in [hp-prof]")
+                        }
                     }
                 }
                 // [hp-ab] freeze/recovery summary every 10 s (tick runs on rtcpQueue — same queue that reads

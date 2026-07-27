@@ -53,6 +53,42 @@ enum AppleRTCPBuilders {
         return d
     }
 
+    /// Temporary Maximum Media Stream Bit Rate Request (RFC 5104 §4.2.1.1, PT=205 FMT=3). 20 bytes.
+    ///
+    /// PROBE, not a proven wire field. The observed problem: `screensharingd` sends roughly the SAME total
+    /// bitrate (~15 Mbps measured) whatever canvas it is encoding — 1920×1080, 2868×1320 and 3840×2160 all
+    /// landed within a few Mbps of each other — so bits-per-pixel collapses as the canvas grows and the
+    /// picture goes blocky. We currently send RR/SR/FIR/PLI/NACK and nothing that expresses a bandwidth
+    /// preference, so if AVConference sizes its encoder from receiver-side signalling it has never heard from
+    /// us. TMMBR is the standard way to say "I can take more"; whether Apple's stack honours it is exactly
+    /// what this measures. If it is ignored, the remaining candidate is the unexplored `res`/params fields in
+    /// the `0x1c` HEVC bank.
+    ///
+    /// The FCI encodes the bitrate as a 6-bit exponent + 17-bit mantissa (`mantissa × 2^exp`), then a 9-bit
+    /// measured-overhead field. `bitsPerSecond` is rounded DOWN to the nearest representable value, so the
+    /// request never overstates what was asked for.
+    static func tmmbr(sender: UInt32, target: UInt32, bitsPerSecond: UInt64, overhead: UInt16 = 0) -> Data {
+        // Find the smallest exponent whose mantissa fits 17 bits (RFC 5104 §4.2.1.2).
+        var exponent: UInt32 = 0
+        var mantissa = bitsPerSecond
+        while mantissa > 0x1FFFF {
+            mantissa >>= 1
+            exponent += 1
+        }
+        let clampedOverhead = UInt32(min(overhead, 0x1FF))
+        let fci = (exponent << 26) | (UInt32(truncatingIfNeeded: mantissa) << 9) | clampedOverhead
+
+        var d = Data()
+        d.append(0x80 | 3)                      // V=2, FMT=3 (TMMBR)
+        d.append(ptTransportFeedback)
+        d.append(UInt16(4), bigEndian: true)    // length = 5 words - 1
+        d.append(sender, bigEndian: true)
+        d.append(UInt32(0), bigEndian: true)    // media source: unused for TMMBR (RFC 5104 §4.2.1.1)
+        d.append(target, bigEndian: true)       // FCI: SSRC the limit applies to
+        d.append(fci, bigEndian: true)          // FCI: exp(6) | mantissa(17) | overhead(9)
+        return d
+    }
+
     /// Picture Loss Indication (RFC 4585 §6.3.1, PT=206 FMT=1). 12 bytes (crib §4f).
     static func pli(sender: UInt32, media: UInt32) -> Data {
         var d = Data()

@@ -121,4 +121,56 @@ final class AppleRTCPBuildersTests: XCTestCase {
         XCTAssertEqual(AppleRTCPBuilders.compoundWithRR(sender: sender, payload: payload),
                        hex("80c90001aabbccdd81ce0002aabbccdd11223344"))
     }
+
+    // MARK: - TMMBR (bitrate probe)
+
+    /// TMMBR is 20 bytes: V=2/FMT=3, PT=205, length=4, sender SSRC, media source 0, then the FCI
+    /// (target SSRC + `exp(6) | mantissa(17) | overhead(9)`).
+    ///
+    /// 60 Mbps needs 9 right-shifts to fit a 17-bit mantissa (60,000,000 >> 9 = 117,187), so
+    /// FCI = (9 << 26) | (117,187 << 9) = 0x24000000 | 0x03938600 = **0x27938600**.
+    func testTMMBRAt60Mbps() {
+        let packet = AppleRTCPBuilders.tmmbr(sender: sender, target: media, bitsPerSecond: 60_000_000)
+
+        XCTAssertEqual(packet.count, 20)
+        XCTAssertEqual(packet, hex("83cd0004aabbccdd000000001122334427938600"))
+    }
+
+    /// The exponent/mantissa split must round DOWN — a request must never claim more than was asked for —
+    /// and must round-trip back to (approximately) the requested rate.
+    func testTMMBREncodesBitrateWithoutOverstating() {
+        for rate: UInt64 in [100_000, 1_000_000, 15_000_000, 60_000_000, 500_000_000] {
+            let packet = AppleRTCPBuilders.tmmbr(sender: sender, target: media, bitsPerSecond: rate)
+            let fci = [UInt8](packet.suffix(4))
+            let word = (UInt32(fci[0]) << 24) | (UInt32(fci[1]) << 16) | (UInt32(fci[2]) << 8) | UInt32(fci[3])
+            let exponent = word >> 26
+            let mantissa = (word >> 9) & 0x1FFFF
+            let decoded = UInt64(mantissa) << UInt64(exponent)
+
+            XCTAssertLessThanOrEqual(decoded, rate, "\(rate): must never overstate the request")
+            XCTAssertGreaterThan(Double(decoded), Double(rate) * 0.999, "\(rate): must not lose real precision")
+            XCTAssertLessThanOrEqual(mantissa, 0x1FFFF, "\(rate): mantissa must fit 17 bits")
+        }
+    }
+
+    /// Small rates need no shifting at all — exponent 0, exact mantissa.
+    func testTMMBRSmallRateUsesExponentZero() {
+        let packet = AppleRTCPBuilders.tmmbr(sender: sender, target: media, bitsPerSecond: 100_000)
+        let fci = [UInt8](packet.suffix(4))
+        let word = (UInt32(fci[0]) << 24) | (UInt32(fci[1]) << 16) | (UInt32(fci[2]) << 8) | UInt32(fci[3])
+
+        XCTAssertEqual(word >> 26, 0, "100000 fits 17 bits, so no exponent is needed")
+        XCTAssertEqual((word >> 9) & 0x1FFFF, 100_000)
+    }
+
+    /// The 9-bit overhead field must be clamped, not allowed to overflow into the mantissa.
+    func testTMMBRClampsOverhead() {
+        let packet = AppleRTCPBuilders.tmmbr(sender: sender, target: media,
+                                             bitsPerSecond: 100_000, overhead: 0xFFFF)
+        let fci = [UInt8](packet.suffix(4))
+        let word = (UInt32(fci[0]) << 24) | (UInt32(fci[1]) << 16) | (UInt32(fci[2]) << 8) | UInt32(fci[3])
+
+        XCTAssertEqual(word & 0x1FF, 0x1FF, "overhead saturates at 9 bits")
+        XCTAssertEqual((word >> 9) & 0x1FFFF, 100_000, "mantissa must be untouched by the clamp")
+    }
 }
