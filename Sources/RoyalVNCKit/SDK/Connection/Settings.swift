@@ -108,13 +108,19 @@ public extension VNCConnection {
 		/// virtual display spreads the same bits over more pixels and the picture goes blocky, worst of all
 		/// when zoomed. The client has never expressed a bandwidth preference (RR/SR/FIR/PLI/NACK say nothing
 		/// about it), so if AVConference sizes its encoder from receiver-side signalling it has never heard
-		/// from us. Whether Apple honours TMMBR is unknown and this is how we find out: watch `pktsPerAU` in
-		/// the `[hp-prof]` line. Ignored unless `enableHighPerformance` is `true`.
+		/// from us. Ignored unless `enableHighPerformance` is `true`.
+		///
+		/// **RESULT: screensharingd IGNORES TMMBR — measured, so this now defaults to 0 (off).** Live probe
+		/// on macOS 27: 60 Mbps requested every 2 s for ~78 s while `pktsPerAU` stayed flat at 1.3–2.6 with no
+		/// trend or step. The builder and this knob are retained because the negative is worth keeping
+		/// reproducible (set a non-zero value to re-run it against a future macOS), but nothing goes on the
+		/// wire by default. The remaining bitrate candidate is the unexplored `res`/params fields in the
+		/// `0x1c` HEVC bank.
 		public let highPerformanceRequestedBitrate: UInt64
 
-		/// Default TMMBR request: 60 Mbps. Comfortably above the observed ~15 Mbps so any honouring of the
-		/// request is unmistakable, while staying plausible for a LAN/Wi-Fi link.
-		public static let defaultRequestedBitrate: UInt64 = 60_000_000
+		/// Default: **0 — send no TMMBR**, because the host was measured ignoring it (see above). 60 Mbps is
+		/// the value the probe used if you want to reproduce that measurement.
+		public static let defaultRequestedBitrate: UInt64 = 0
 
 #if canImport(ObjectiveC)
 		@objc(frameEncodings)

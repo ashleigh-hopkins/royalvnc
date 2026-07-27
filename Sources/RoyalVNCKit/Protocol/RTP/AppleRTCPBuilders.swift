@@ -55,14 +55,14 @@ enum AppleRTCPBuilders {
 
     /// Temporary Maximum Media Stream Bit Rate Request (RFC 5104 §4.2.1.1, PT=205 FMT=3). 20 bytes.
     ///
-    /// PROBE, not a proven wire field. The observed problem: `screensharingd` sends roughly the SAME total
-    /// bitrate (~15 Mbps measured) whatever canvas it is encoding — 1920×1080, 2868×1320 and 3840×2160 all
-    /// landed within a few Mbps of each other — so bits-per-pixel collapses as the canvas grows and the
-    /// picture goes blocky. We currently send RR/SR/FIR/PLI/NACK and nothing that expresses a bandwidth
-    /// preference, so if AVConference sizes its encoder from receiver-side signalling it has never heard from
-    /// us. TMMBR is the standard way to say "I can take more"; whether Apple's stack honours it is exactly
-    /// what this measures. If it is ignored, the remaining candidate is the unexplored `res`/params fields in
-    /// the `0x1c` HEVC bank.
+    /// **`screensharingd` IGNORES THIS — measured, and it is off by default (`Settings`
+    /// `defaultRequestedBitrate == 0`).** Kept so the negative stays reproducible against a future macOS.
+    ///
+    /// The probe: the client had never expressed a bandwidth preference (we send RR/SR/FIR/PLI/NACK, none of
+    /// which mentions rate), so if AVConference sized its encoder from receiver-side signalling it had never
+    /// heard from us. TMMBR is the standard way to say "I can take more". Live on macOS 27, 60 Mbps requested
+    /// every 2 s for ~78 s left `pktsPerAU` flat at 1.3–2.6 — no trend, no step. The remaining bitrate
+    /// candidate is the unexplored `res`/params fields in the `0x1c` HEVC bank.
     ///
     /// The FCI encodes the bitrate as a 6-bit exponent + 17-bit mantissa (`mantissa × 2^exp`), then a 9-bit
     /// measured-overhead field. `bitsPerSecond` is rounded DOWN to the nearest representable value, so the
