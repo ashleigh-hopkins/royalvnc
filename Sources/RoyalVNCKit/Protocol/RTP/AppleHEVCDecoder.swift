@@ -49,13 +49,18 @@ final class AppleHEVCDecoder {
     /// never wipe the DPB (crib §3 risk 7). A genuine SPS/resolution change rebuilds.
     private var builtSignature: Data?
 
-    private var diagCount = 0   // TEMP: single-tile decode diagnosis (not DEBUG-guarded; harness builds release)
+    #if DEBUG
+    private var diagCount = 0   // TEMP [hp-dec]: single-tile decode diagnosis
 
     // TEMP-MEASUREMENT [hp-split]: decompose the per-AU cost that `[hp-prof] decodeMs` lumps together.
     // The inline VT completion handler runs INSIDE VTDecompressionSessionDecodeFrame, so the only way to
     // separate real HW decode from the downstream callback (app composite + LTR-ACK) is to time the handler
     // and subtract it from the decode call's span. Resolves: is the ceiling HW compute, blocked wait, or
     // inline callback work? Read+reset by the media receiver once per second.
+    //
+    // DEBUG-only: this costs six `DispatchTime.now()` reads per access unit on the decode-critical worker
+    // queue, which is exactly the path being measured. A measurement that ships is a measurement that
+    // changes what it measures.
     private(set) var probeSignatureNs: UInt64 = 0    // harvest + per-AU param signature build/compare
     private(set) var probeSampleBuildNs: UInt64 = 0  // makeSampleBuffer (malloc + memcpy + CoreMedia objects)
     private(set) var probeVTNs: UInt64 = 0           // decode call span MINUS the inline callback = real VT
@@ -71,6 +76,7 @@ final class AppleHEVCDecoder {
         }
         return (probeSignatureNs, probeSampleBuildNs, probeVTNs, probeCallbackNs, probeFeeds, probeAUs)
     }
+    #endif
     private(set) var framesDecoded = 0
     private(set) var decodeErrors = 0
     private(set) var negotiatedPixelFormat: OSType?
@@ -98,9 +104,12 @@ final class AppleHEVCDecoder {
     /// slices. No-ops until a full VPS+SPS+PPS set has been seen. `donl` = the AU's first-packet DONL,
     /// forwarded to `onFrame` (for the LTR-ACK); `nil` for a params-only feed.
     func decode(nals: [Data], context: UInt32, donl: UInt16? = nil) {
+        #if DEBUG
         let tSig0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT [hp-split]
+        #endif
         harvestParameterSets(nals)
         rebuildIfParametersChanged(context: context)
+        #if DEBUG
         probeSignatureNs &+= DispatchTime.now().uptimeNanoseconds &- tSig0
         probeAUs += 1
 
@@ -112,6 +121,7 @@ final class AppleHEVCDecoder {
             }
             print("[hp-dec] ctx=\(context) nals=\(types) vps=\(vps != nil) sps=\(sps != nil) pps=\(ppsList.count) session=\(session != nil)")
         }
+        #endif
 
         guard let session, let formatDescription else { return }
 
@@ -223,17 +233,21 @@ final class AppleHEVCDecoder {
     // MARK: - Feeding
 
     private func feed(nal: Data, session: VTDecompressionSession, format: CMFormatDescription, context: UInt32, donl: UInt16?) {
+        #if DEBUG
         let tBuild0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT [hp-split]
+        #endif
         guard let sample = makeSampleBuffer(nal: nal, format: format) else {
             recordError(noErr, context: context)
             return
         }
+        #if DEBUG
         probeSampleBuildNs &+= DispatchTime.now().uptimeNanoseconds &- tBuild0
         probeFeeds += 1
         // The completion handler fires INLINE inside the decode call below; accumulate its own span here so
         // it can be subtracted → probeVTNs = real HW decode, probeCallbackNs = downstream inline work.
         var callbackNs: UInt64 = 0
         let tDec0 = DispatchTime.now().uptimeNanoseconds
+        #endif
         // SYNCHRONOUS decode (flags: []): the output handler fires inline before this returns, so decode
         // never falls behind its own feed. Async decode (`kVTDecodeFrame_EnableAsynchronousDecompression`)
         // was tried for throughput but WEDGED under FMV load on A18 — large frames fed at high rate into the
@@ -245,8 +259,10 @@ final class AppleHEVCDecoder {
             session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
         ) { [weak self] status, _, imageBuffer, _, _ in
             guard let self else { return }
+            #if DEBUG
             let tCb0 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT [hp-split]
             defer { callbackNs &+= DispatchTime.now().uptimeNanoseconds &- tCb0 }
+            #endif
             if status == noErr, let imageBuffer {
                 self.framesDecoded += 1
                 if self.negotiatedPixelFormat == nil {
@@ -257,10 +273,12 @@ final class AppleHEVCDecoder {
                 self.recordError(status, context: context)
             }
         }
+        #if DEBUG
         // TEMP-MEASUREMENT [hp-split]: decode-call span minus the inline callback = real VT decode cost.
         let span = DispatchTime.now().uptimeNanoseconds &- tDec0
         probeVTNs &+= span > callbackNs ? (span &- callbackNs) : 0
         probeCallbackNs &+= callbackNs
+        #endif
         if status != noErr { recordError(status, context: context) }
     }
 

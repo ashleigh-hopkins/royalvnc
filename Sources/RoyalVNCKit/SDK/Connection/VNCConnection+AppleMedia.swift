@@ -259,6 +259,7 @@ extension VNCConnection {
         func addCtrl() { lock.lock(); _ctrl += 1; lock.unlock() }
     }
 
+    #if DEBUG
     /// TEMP-MEASUREMENT (removed after on-device verify): localizes the live throughput limiter. All calls
     /// happen on the single video *worker* queue (post-decouple) → no locking. One `[hp-prof]` line/wall-sec:
     ///  - busyFrac  = Σ(worker exit−entry)/wall  → worker-queue compute saturation (≈1.0 = compute-bound)
@@ -384,18 +385,23 @@ extension VNCConnection {
             }
         }
     }
+    #endif
 
     /// Owns the two UDP media sockets + the RTCP keep-alive loop for the life of the connection.
     final class MediaReceiver {
         let stats = MediaStats()
+        #if DEBUG
         /// TEMP-MEASUREMENT (not for commit).
         var profiler: MediaProfiler?
         /// TEMP-MEASUREMENT: ingress probe on the socket queue (set in `startMediaReceive`).
         var ingressProbe: IngressProbe?
+        #endif
         /// TEMP-MEASUREMENT: last FIR send time (stamped on rtcpQueue at both FIR sites), read on the worker
         /// to log FIR→IDR recovery latency. Benign cross-thread read of a diagnostic timestamp.
         var firSentNs: UInt64 = 0
-        var rawDiagCount = 0   // TEMP: single-tile out-of-band param location
+        #if DEBUG
+        var rawDiagCount = 0   // TEMP [hp-raw]: single-tile out-of-band param location
+        #endif
         /// Video RX uses a raw SOCK_DGRAM socket (large SO_RCVBUF, dedicated recv thread) — NWConnection's
         /// UDP receive stalls ~200-300ms on device and drops the high-bitrate tiles (measured). Ctrl (RTCP
         /// TX + low RX) stays on NWConnection.
@@ -443,6 +449,7 @@ extension VNCConnection {
         var tmmbrBitsPerSecond: UInt64 = 0
         /// AUs dropped because their SSRC had no tile slot. Non-zero means an extra SSRC group is live.
         var ssrcUnmappedDrops: Int { tileMap.unmappedDrops }
+        #if DEBUG
         /// TEMP-MEASUREMENT ([hp-tile]): per-SSRC set of HEVC NAL types EVER seen — decisive for tile
         /// independence. If every tile carries its own SPS(33)+IDR(19/20), the 4 streams are independent
         /// (→ 4 parallel VTDecompressionSessions viable). If only tile-0 carries SPS/IDR, tiles 1-3
@@ -450,6 +457,7 @@ extension VNCConnection {
         private var splitWinStartNs: UInt64 = 0   // TEMP-MEASUREMENT [hp-split] window
         private var tileTypeSets: [UInt32: Set<Int>] = [:]
         private var tileIRAPCounts: [UInt32: Int] = [:]
+        #endif
         private(set) var hevcFramesDecoded = 0
         private var hevcLoggedFirstFrame = false
         private(set) var hevcDroppedGappedAUs = 0
@@ -543,21 +551,29 @@ extension VNCConnection {
                 self.diagLock.unlock()
                 self.stats.addVideo()
                 guard let dec = self.srtpDecryptor, let (header, payload) = dec.decrypt(packet: data) else {
+                    #if DEBUG
                     let te = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
                     self.profiler?.recordPacket(busyNs: te - t0, decryptNs: te - t0, decodeNs: 0)
+                    #endif
                     return
                 }
+                #if DEBUG
                 let tDec = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
+                #endif
                 self.stats.addDecrypted()
-                if self.rawDiagCount < 60 {   // TEMP: locate out-of-band params for single-tile stream
+                #if DEBUG
+                if self.rawDiagCount < 60 {   // TEMP [hp-raw]: locate out-of-band params for single-tile stream
                     self.rawDiagCount += 1
                     let p = [UInt8](payload.prefix(6))
                     logger.logDebug("[hp-raw] pt=\(header.payloadType) ssrc=\(header.ssrc & 0xFFFF) seq=\(header.sequenceNumber) mark=\(header.marker) len=\(payload.count) first=\(p.map { String(format: "%02x", $0) }.joined())")
                 }
+                #endif
                 self.handleDecryptedVideo(header: header, payload: payload, logger: logger)
+                #if DEBUG
                 let t1 = DispatchTime.now().uptimeNanoseconds   // TEMP-MEASUREMENT
                 self.profiler?.recordPacket(busyNs: t1 - t0, decryptNs: tDec - t0, decodeNs: t1 - tDec)
-#if canImport(VideoToolbox)
+                #endif
+#if canImport(VideoToolbox) && DEBUG
                 // TEMP-MEASUREMENT [hp-split]: once per wall-second, decompose the per-AU decode cost that
                 // [hp-prof] decodeMs lumps together. vtMs = real HW decode; cbMs = inline downstream callback
                 // (app composite + LTR-ACK); buildMs = sample-buffer construction; sigMs = param re-signature.
@@ -593,7 +609,9 @@ extension VNCConnection {
             guard let au = hevcAssembler.add(ssrc: header.ssrc, timestamp: header.timestamp,
                                              sequence: header.sequenceNumber, marker: header.marker,
                                              payload: payload) else { return }
+            #if DEBUG
             profiler?.recordAU(ssrc: au.ssrc, timestamp: au.timestamp, hasGap: au.hasGap)   // TEMP-MEASUREMENT
+            #endif
 #if canImport(VideoToolbox)
             // Resolve the tile FIRST. An SSRC with no slot (an extra group arriving inside the coalescing
             // window) is dropped here with NO side effects — in particular it must not be allowed to flip the
@@ -613,6 +631,9 @@ extension VNCConnection {
             // CRA 21). The win under motion = these lines COLLAPSE (LTR recovery is a small P-delta, not an
             // IRAP); `hasGap=Y` on a recovery IRAP = a FIR-storm still present.
             // TEMP-MEASUREMENT [hp-tile]: track per-SSRC NAL-type set + IRAP count (tile-independence probe).
+            // DEBUG-only: it walks every NAL of every AU twice (a Set insert plus a compactMap allocation) on
+            // the decode-critical worker, and its question is already answered — only tile-0 emits an IRAP.
+            #if DEBUG
             do {
                 var set = tileTypeSets[au.ssrc] ?? []
                 let before = set.count
@@ -628,6 +649,7 @@ extension VNCConnection {
                     }
                 }
             }
+            #endif
             let irapType = nals.compactMap { AppleHEVCDepacketizer.nalType($0) }.first { AppleHEVCDepacketizer.isIRAP($0) }
             if let irapType {
                 let nowNs = DispatchTime.now().uptimeNanoseconds
@@ -964,8 +986,10 @@ extension VNCConnection {
         let receiver = MediaReceiver(videoUDP: videoUDP, ctrlUDP: ctrlUDP)
         let stats = receiver.stats
         let logger = self.logger
+        #if DEBUG
         receiver.profiler = MediaProfiler(logger: logger)   // TEMP-MEASUREMENT
         receiver.ingressProbe = IngressProbe(logger: logger)   // TEMP-MEASUREMENT
+        #endif
 
         let decryptor = try? AppleSRTPDecryptor(masterBlob: videoKeyS)
         if decryptor == nil { logger.logError("[hp-media] could not build SRTP decryptor from vks") }
@@ -979,7 +1003,9 @@ extension VNCConnection {
         // `receiveMessage` re-arms immediately (drains UDP at line rate). All decrypt/assemble/decode work
         // — and the throttled [hp-rtp] summary — runs on the worker (see `enqueueVideoDatagram`).
         videoUDP.start(onDatagram: { [weak receiver] data in
+            #if DEBUG
             receiver?.ingressProbe?.record(datagram: data)   // TEMP-MEASUREMENT (recv thread, pre-worker)
+            #endif
             receiver?.enqueueVideoDatagram(data, logger: logger)
         }, onState: { state in
             logger.logDebug("[hp-media] video UDP(\(videoPort)) [raw] state: \(state)")
