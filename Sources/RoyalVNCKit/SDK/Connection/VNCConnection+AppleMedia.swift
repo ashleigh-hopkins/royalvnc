@@ -427,13 +427,16 @@ extension VNCConnection {
         /// ABSENT on single-tile (tilesPerFrame=1). Auto-detected from the parameter-set Aggregation Packet;
         /// defaults to true (4-tile behavior) until an AP is seen. Getting it wrong drops params / corrupts FUs.
         private var hevcDONL = true
-        private var hevcKnownSSRCs: [UInt32] = []
+        /// SSRC→tile map (pure value type, unit-tested; see `AppleTileMap`). Touched only on the video worker
+        /// queue. Handles SSRC-group rotation and DROPS an SSRC that has no tile slot rather than aliasing it
+        /// onto an occupied tile.
+        private var tileMap = AppleTileMap()
         /// Tiles the negotiated canvas says to expect (set from the `0x1c` answer). Bounds the SSRC→tile map so
         /// a mid-session SSRC-group rotation can't inflate tile indices past the geometry. Defaults to the
         /// 4-tile offer we send.
         var expectedTileCount = 4
-        /// Last SSRC-group reset (video worker queue) — ≥3 s coalescing guard, matching the reference.
-        private var lastSSRCGroupResetNs: UInt64 = 0
+        /// AUs dropped because their SSRC had no tile slot. Non-zero means an extra SSRC group is live.
+        var ssrcUnmappedDrops: Int { tileMap.unmappedDrops }
         /// TEMP-MEASUREMENT ([hp-tile]): per-SSRC set of HEVC NAL types EVER seen — decisive for tile
         /// independence. If every tile carries its own SPS(33)+IDR(19/20), the 4 streams are independent
         /// (→ 4 parallel VTDecompressionSessions viable). If only tile-0 carries SPS/IDR, tiles 1-3
@@ -586,13 +589,16 @@ extension VNCConnection {
                                              payload: payload) else { return }
             profiler?.recordAU(ssrc: au.ssrc, timestamp: au.timestamp, hasGap: au.hasGap)   // TEMP-MEASUREMENT
 #if canImport(VideoToolbox)
+            // Resolve the tile FIRST. An SSRC with no slot (an extra group arriving inside the coalescing
+            // window) is dropped here with NO side effects — in particular it must not be allowed to flip the
+            // per-stream DONL detection below, and it must never be decoded into another tile's strip.
+            guard let tile = tileIndex(for: au.ssrc, logger: logger) else { return }
             // Auto-detect DONL presence from the parameter-set AP (single-tile omits it); apply per-stream.
             if let first = au.orderedPayloads.first,
                let detected = AppleHEVCDepacketizer.detectDONL(fromAggregationPacket: first) {
                 hevcDONL = detected
             }
             let nals = AppleHEVCDepacketizer.depacketizeAccessUnit(au.orderedPayloads, donl: hevcDONL)
-            let tile = tileIndex(for: au.ssrc, logger: logger)
             // ltr_id = the tile-0 AU's first-packet 16-bit DONL, zero-extended (no transform); forwarded to
             // the decode-success callback so a cleanly-decoded tile-0 frame can be ACKed.
             let donl = AppleHEVCDepacketizer.firstDONL(au.orderedPayloads, donl: hevcDONL)
@@ -691,29 +697,33 @@ extension VNCConnection {
         /// tile. So once the map is full, an unknown SSRC is treated as a NEW GROUP: reset the map and the
         /// per-tile decode state and start over. A ≥3 s coalescing guard (matching the reference) stops a
         /// burst of new groups from thrashing the reset.
-        private func tileIndex(for ssrc: UInt32, logger: VNCLogger) -> UInt32 {
-            if !hevcKnownSSRCs.contains(ssrc) {
-                let expected = expectedTileCount
-                if hevcKnownSSRCs.count >= expected {
-                    let now = DispatchTime.now().uptimeNanoseconds
-                    if lastSSRCGroupResetNs == 0 || now &- lastSSRCGroupResetNs > 3_000_000_000 {
-                        lastSSRCGroupResetNs = now
-                        logger.logDebug("[hp-ssrc] new SSRC group (ssrc=\(ssrc & 0xFFFF) arrived with \(hevcKnownSSRCs.count)/\(expected) known) — resetting tile map + per-tile decode state")
-                        hevcKnownSSRCs.removeAll(keepingCapacity: true)
-                        hevcAssembler = AppleHEVCAccessUnitAssembler()
-                        chainClean.removeAll(keepingCapacity: true)
-                    } else {
-                        // Inside the coalescing window: ignore the extra group rather than thrash. The SSRC
-                        // still gets an index below (map has room only if the reset above ran).
-                        logger.logDebug("[hp-ssrc] extra SSRC \(ssrc & 0xFFFF) within 3s coalescing window — not resetting")
-                    }
+        ///
+        /// Returns `nil` when the SSRC has NO legitimate slot, and the caller must then DROP the access unit.
+        /// An unmappable SSRC must never be aliased onto a real tile: the previous code appended it anyway and
+        /// clamped the index to `expectedTileCount - 1`, so an extra stream arriving inside the coalescing
+        /// window rendered into the LAST tile alongside the real one — two different streams writing the same
+        /// strip, i.e. foreign content flickering in the bottom band, plus that tile's chain-clean/LTR-ACK
+        /// state keyed to whichever stream wrote last. Dropping is strictly better: one strip goes stale for
+        /// at most the coalescing window (`loadAction .load` keeps its last good content) instead of showing
+        /// another region's pixels, and the next out-of-window unknown SSRC performs a clean group reset.
+        private func tileIndex(for ssrc: UInt32, logger: VNCLogger) -> UInt32? {
+            tileMap.expectedTileCount = expectedTileCount
+            switch tileMap.outcome(for: ssrc, nowNs: DispatchTime.now().uptimeNanoseconds) {
+            case .index(let tile):
+                return tile
+            case .indexAfterGroupReset(let tile):
+                // A new SSRC group took over: rebuild the per-group decode state the old SSRCs owned.
+                logger.logDebug("[hp-ssrc] new SSRC group (ssrc=\(ssrc & 0xFFFF), reset #\(tileMap.groupResets)) — tile map + per-tile decode state reset")
+                hevcAssembler = AppleHEVCAccessUnitAssembler()
+                chainClean.removeAll(keepingCapacity: true)
+                return tile
+            case .drop:
+                let drops = tileMap.unmappedDrops
+                if drops == 1 || drops % 1000 == 0 {
+                    logger.logDebug("[hp-ssrc] SSRC \(ssrc & 0xFFFF) has no tile slot (expected \(expectedTileCount)) — dropping its AUs rather than aliasing onto a real tile (unmappedDrops=\(drops))")
                 }
-                hevcKnownSSRCs.append(ssrc)
-                hevcKnownSSRCs.sort()
+                return nil
             }
-            let idx = hevcKnownSSRCs.firstIndex(of: ssrc) ?? 0
-            // Clamp so a transient over-long map can never index past the canvas geometry.
-            return UInt32(min(idx, max(0, expectedTileCount - 1)))
         }
 
 #if canImport(VideoToolbox)
