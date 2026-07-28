@@ -11,6 +11,10 @@ public extension VNCError {
 		case securityHandshakingFailed(reason: String?)
 		case noAuthenticationDataProvided
 		case ardAuthenticationFailed
+		/// The server accepted the Apple RSA-SRP proof and then refused the session anyway — an
+		/// authorization decision taken after authentication, so the credential is NOT the problem.
+		/// See `VNCProtocol.ARDRSASRPAuthentication.SecurityResultVerdict.sessionRefusedAfterProof`.
+		case ardSessionRefusedAfterAuthentication
 		case ultraVNCMSLogonIIAuthenticationFailed
 		case encryptionFailed
 
@@ -30,6 +34,8 @@ public extension VNCError {
 					return "No authentication data was provided."
 				case .ardAuthenticationFailed:
 					return "Apple Remote Desktop authentication failed."
+				case .ardSessionRefusedAfterAuthentication:
+					return "The Mac accepted the credentials but refused the screen sharing session."
 				case .ultraVNCMSLogonIIAuthenticationFailed:
 					return "UltraVNC MS-Logon II authentication failed."
 				case .encryptionFailed:

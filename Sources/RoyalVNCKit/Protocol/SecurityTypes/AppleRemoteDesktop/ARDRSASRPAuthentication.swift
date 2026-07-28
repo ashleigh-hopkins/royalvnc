@@ -41,6 +41,45 @@ extension VNCProtocol {
             let wrapKey: Data
         }
 
+        /// What the server's final message means. `SecurityResult != 0` is NOT necessarily a credential
+        /// failure: the daemon reports the same non-zero result whether it rejected our SRP proof or
+        /// accepted it and then refused the session for its own reasons (see `sessionRefusedAfterProof`).
+        enum SecurityResultVerdict: Equatable {
+            /// `SecurityResult == 0` — proof accepted and the session granted.
+            case authenticated
+            /// The server rejected the SRP proof itself: wrong username/password. Retrying with the same
+            /// credential cannot help.
+            case proofRejected
+            /// The server ACCEPTED the SRP proof (it returned a full-size `M2`, which it can only compute
+            /// from the account verifier) and then refused the session anyway — an authorization decision
+            /// made after authentication, not a credential problem.
+            ///
+            /// Live evidence (macOS 27 `screensharingd`, captured 2026-07-28): after `srp_server_mech_step: 0`
+            /// the daemon runs an OpenDirectory `naprivs` / admin-group query and, when that resolves to
+            /// `p level 0` / `not valid admin`, sends `SecurityResult=1` — with the SAME 98-byte `M2` it
+            /// sends on success. The credential was correct in that capture (four other auths on the same
+            /// account in the same hour logged `valid admin`).
+            case sessionRefusedAfterProof
+        }
+
+        /// Shortest `M2` that can be a genuine SRP proof.
+        ///
+        /// HEURISTIC — ORACLE-gated on two live samples, NOT a pinned wire fact. Observed: the rejection
+        /// stub is 6 bytes (`srp_server_mech_step: -13`), a success proof is 98 bytes
+        /// (`srp_server_mech_step: 0`). 64 is the principled floor between them: any real proof carries at
+        /// least one full SHA-512 digest, and no 6-byte stub can. If Apple ever shortens the success `M2`
+        /// or lengthens the stub past 64, this misclassifies — the caller must keep the consequence of a
+        /// misclassification bounded (the app allows at most one extra, widely-spaced retry).
+        static let minimumProofM2Length: UInt32 = 64
+
+        /// Pure decision core for the server's final message, extracted so the "authenticated but refused"
+        /// distinction is unit-testable without a socket or a live SRP exchange.
+        static func classify(m2Length: UInt32, securityResult: UInt32) -> SecurityResultVerdict {
+            guard securityResult != 0 else { return .authenticated }
+
+            return m2Length >= minimumProofM2Length ? .sessionRefusedAfterProof : .proofRejected
+        }
+
         /// Injectable randomness (NFR-3). Defaults to `SecRandomCopyBytes` in production (A3).
         let randomBytes: (Int) throws -> Data
 
@@ -160,10 +199,20 @@ extension VNCProtocol {
             }
             _ = try await connection.readBuffered(length: Int(m2Len))   // M2 consumed, not verified (reference parity)
             let securityResult = try await connection.readUInt32()
-            logger.logDebug("[ard33] SecurityResult=\(securityResult)")
 
-            guard securityResult == 0 else {
+            // A non-zero SecurityResult does NOT prove the credential was wrong — the daemon returns the
+            // same code when it accepted the proof and then refused the session (`Self.classify`). Report
+            // the two apart so the caller can retry the refusal without hammering auth on a bad password.
+            let verdict = Self.classify(m2Length: m2Len, securityResult: securityResult)
+            logger.logDebug("[ard33] SecurityResult=\(securityResult) verdict=\(verdict)")
+
+            switch verdict {
+            case .authenticated:
+                break
+            case .proofRejected:
                 throw VNCError.authentication(.ardAuthenticationFailed)
+            case .sessionRefusedAfterProof:
+                throw VNCError.authentication(.ardSessionRefusedAfterAuthentication)
             }
 
             return Success(wrapKey: AppleSRPClient.wrapKey(K: srp.K))
