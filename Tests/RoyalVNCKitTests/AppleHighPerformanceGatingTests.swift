@@ -1,10 +1,12 @@
 import XCTest
 @testable import RoyalVNCKit
 
-/// Regression tests for the HP gating (HP-SPECS §4.2 / §5.1 / AC-5): with `enableHighPerformance`
-/// OFF the client is byte-identical to the standard path — the `003.889` banner is never sent, type
-/// 33 is never selected, and the connection object is a bare `NetworkConnection` (no record-layer
-/// decorator). With it ON the gates engage.
+/// Regression tests for the HP gating (HP-SPECS §4.2 / §5.1 / AC-5; TYPE33-STANDARD-SPECS §3.2/§3.3):
+/// with `mode == .standardRFB` the client is byte-identical to the standard path — the `003.889`
+/// banner is never sent, type 33 is never selected, and the connection object is a bare
+/// `NetworkConnection` (no record-layer decorator). With `mode == .appleHighPerformanceMedia` the
+/// gates engage. (`enableHighPerformance: Bool` was removed with no shim — Q1 DECIDED, single
+/// consumer, no `@objc` exposure — and replaced by the `SessionMode` enum.)
 final class AppleHighPerformanceGatingTests: XCTestCase {
     // MARK: - Banner (pure)
 
@@ -32,23 +34,43 @@ final class AppleHighPerformanceGatingTests: XCTestCase {
 
     // MARK: - Settings default
 
-    func testEnableHighPerformanceDefaultsOff() {
-        let settings = Self.makeSettings(enableHighPerformance: false)
+    func testSessionModeDefaultsStandardRFB() {
+        let settings = Self.makeSettings(mode: .standardRFB)
 
-        XCTAssertFalse(settings.enableHighPerformance, "HP must default OFF (Q1)")
+        XCTAssertEqual(settings.mode, .standardRFB, "SessionMode must default to .standardRFB (Q1)")
+        XCTAssertFalse(settings.usesAppleControlChannel)
+        XCTAssertFalse(settings.negotiatesHighPerformanceMedia)
+    }
+
+    func testDerivedHelpersForEachSessionMode() {
+        XCTAssertFalse(Self.makeSettings(mode: .standardRFB).usesAppleControlChannel)
+        XCTAssertFalse(Self.makeSettings(mode: .standardRFB).negotiatesHighPerformanceMedia)
+
+        XCTAssertTrue(Self.makeSettings(mode: .appleStandardFramebuffer).usesAppleControlChannel)
+        XCTAssertFalse(Self.makeSettings(mode: .appleStandardFramebuffer).negotiatesHighPerformanceMedia)
+
+        XCTAssertTrue(Self.makeSettings(mode: .appleHighPerformanceMedia).usesAppleControlChannel)
+        XCTAssertTrue(Self.makeSettings(mode: .appleHighPerformanceMedia).negotiatesHighPerformanceMedia)
     }
 
     // MARK: - Connection object (some -> any wrap)
 
-    func testConnectionIsBareWhenHPOff() {
-        let connection = VNCConnection(settings: Self.makeSettings(enableHighPerformance: false))
+    func testConnectionIsBareWhenStandardRFB() {
+        let connection = VNCConnection(settings: Self.makeSettings(mode: .standardRFB))
 
         XCTAssertFalse(connection.connection is AppleRecordLayerConnection,
-                       "HP OFF must leave the connection bare — no record-layer decorator (AC-5)")
+                       ".standardRFB must leave the connection bare — no record-layer decorator (AC-5)")
+    }
+
+    func testConnectionIsWrappedForAppleStandardFramebuffer() {
+        let connection = VNCConnection(settings: Self.makeSettings(mode: .appleStandardFramebuffer))
+
+        XCTAssertTrue(connection.connection is AppleRecordLayerConnection,
+                      ".appleStandardFramebuffer wraps the base in the record-layer decorator too — it authenticates as Apple (usesAppleControlChannel) even though it never negotiates media")
     }
 
     func testConnectionIsWrappedWhenHPOn() {
-        let connection = VNCConnection(settings: Self.makeSettings(enableHighPerformance: true))
+        let connection = VNCConnection(settings: Self.makeSettings(mode: .appleHighPerformanceMedia))
 
         XCTAssertTrue(connection.connection is AppleRecordLayerConnection,
                       "HP ON wraps the base in the record-layer decorator (passthrough at creation)")
@@ -64,7 +86,7 @@ final class AppleHighPerformanceGatingTests: XCTestCase {
     ///   4. It then tries ARD (type-30) auth; the scripted server has no more bytes so the read
     ///      throws — we only assert the banner + the selected security-type byte captured before that.
     func testHandshakeOffDowngradesBannerAndIgnoresType33() async throws {
-        let connection = VNCConnection(settings: Self.makeSettings(enableHighPerformance: false))
+        let connection = VNCConnection(settings: Self.makeSettings(mode: .standardRFB))
         let mock = MockNetworkConnection(inbound: Self.serverOffer())
         connection.connection = mock
 
@@ -139,7 +161,7 @@ final class AppleHighPerformanceGatingTests: XCTestCase {
         XCTAssertFalse(VNCConnection.canvasFromLayout(empty, offeredTileCount: 4, offeredLTRP: true).isReady)
     }
 
-    private static func makeSettings(enableHighPerformance: Bool) -> VNCConnection.Settings {
+    private static func makeSettings(mode: VNCConnection.Settings.SessionMode) -> VNCConnection.Settings {
         VNCConnection.Settings(isDebugLoggingEnabled: false,
                                hostname: "localhost",
                                port: 5900,
@@ -150,6 +172,6 @@ final class AppleHighPerformanceGatingTests: XCTestCase {
                                isClipboardRedirectionEnabled: false,
                                colorDepth: .depth24Bit,
                                frameEncodings: [],
-                               enableHighPerformance: enableHighPerformance)
+                               mode: mode)
     }
 }

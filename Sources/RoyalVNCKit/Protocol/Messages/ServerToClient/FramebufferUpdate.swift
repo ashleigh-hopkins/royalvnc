@@ -47,6 +47,11 @@ extension VNCProtocol.FramebufferUpdate {
 			let encodingType = rectangle.encodingType
 
 			guard let encoding = encodings[.init(encodingType)] else {
+				// SPECS §5.4/FR-7: an unregistered encoding id has unknown wire length — it cannot be
+				// skipped without desyncing the byte stream, so this MUST stay fatal (no blanket
+				// catch-all). Log the id first so the failure is diagnosable instead of an opaque
+				// disconnect.
+				logger.logError("Unsupported encoding type=\(encodingType) — failing the connection (cannot skip an unregistered encoding without desyncing)")
 				throw VNCError.protocol(.unsupportedEncoding(encodingType: .init(encodingType)))
 			}
 

@@ -26,11 +26,24 @@ extension VNCConnection {
 	}
 
 	func sendFramebufferUpdateRequest() async throws {
+		// SPECS §4.4/FR-4: the Apple-Standard tier's ONLY per-viewer push mechanism is AutoFBU
+		// (wire[4..7]=0), armed once during performAppleStandardControlBringUp(), which also sends the
+		// tier's ONE allowed initial FramebufferUpdateRequest directly (not via this zero-arg wrapper).
+		// This function is otherwise called both at initial-connect (connectionDidBecomeReady, which
+		// already skips it for this tier — see the settings.usesAppleControlChannel branch there) AND,
+		// critically, after EVERY decoded update on the standard receive loop
+		// (handleFramebufferUpdateMessage()/handleEndOfContinuousUpdatesMessage(), reused unchanged by
+		// this tier per SPECS §5.1). Left ungated, that per-update call would re-request on every single
+		// frame — exactly the *steady-state* polling FR-4 forbids, and the device-confirmed "Change B"
+		// stall (fork note #6): requesting while the daemon is still mid-transmitting makes
+		// screensharingd stop answering. `continuousUpdatesEnabledLocked()` cannot substitute for this
+		// guard — this tier never enables RFB Continuous Updates, so that flag stays false throughout.
 		guard let framebuffer,
-              !continuousUpdatesEnabledLocked() else {
+              !continuousUpdatesEnabledLocked(),
+              !settings.usesAppleControlChannel else {
             return
         }
-        
+
 		let incremental = state.incrementalUpdatesEnabled
 
 		let fullFramebufferRegion = VNCRegion(location: .zero,

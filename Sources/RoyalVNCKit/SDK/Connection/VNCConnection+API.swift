@@ -157,15 +157,21 @@ public extension VNCConnection {
 	// thread-safe client-to-server message queue, so it is safe to call from the main thread like the
 	// mouse/keyboard input APIs.
 	//
-	// T12: in High Performance mode the standard RFB `ClientCutText` (`0x06`) is a dead end against
-	// macOS screensharingd (it only writes the legacy latin-1 scrap). So HP sessions route to Apple's
-	// rich `0x1f` ClipboardSend instead (`sendAppleClipboardText`). Non-HP sessions are unchanged. This
-	// keeps callers (the app) transport-agnostic — they always call `sendClientCutText`.
+	// T12: on an Apple-authenticated session the standard RFB `ClientCutText` (`0x06`) is a dead end
+	// against macOS screensharingd (it only writes the legacy latin-1 scrap). So Apple sessions route to
+	// Apple's rich `0x1f` ClipboardSend instead (`sendAppleClipboardText`) — but ONLY when clipboard
+	// redirection is actually enabled (Area-3 fix, SPECS §3.2/§5.3, AC-6): the Apple-Standard tier's
+	// bring-up intentionally skips the `0x15`/`0x0b` enable-fetch this needs, and that tier's standard
+	// receive loop has no tolerance for an unsolicited `0x1f` reply — so with redirection off this falls
+	// through to the standard `0x06` (a harmless no-op against screensharingd, per the T12 finding),
+	// rather than emitting an un-primed `0x1f` that could tear down a live session on a stray manual-Paste
+	// tap. Non-Apple sessions are unaffected. This keeps callers (the app) transport-agnostic — they
+	// always call `sendClientCutText`.
 #if canImport(ObjectiveC)
 	@objc
 #endif
 	func sendClientCutText(_ text: String) {
-		if settings.enableHighPerformance {
+		if settings.usesAppleControlChannel, settings.isClipboardRedirectionEnabled {
 			sendAppleClipboardText(text)
 		} else {
 			enqueueClientCutTextMessage(text)

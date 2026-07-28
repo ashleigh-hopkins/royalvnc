@@ -25,7 +25,7 @@ import Network
 ///   never reset (dossier §3.3).
 ///
 /// Insertion is HP-gated: `VNCConnection` only wraps the base in this decorator when
-/// `Settings.enableHighPerformance` is on, so the standard-RFB path never carries the decorator
+/// `Settings.usesAppleControlChannel` is on, so the standard-RFB path never carries the decorator
 /// (HP-SPECS §4.2, AC-5). Because only the two `NetworkConnection` read/write *primitives*
 /// (`read(minimumLength:maximumLength:)`, `write(data:)`) are overridden, every higher-level reader
 /// (`readUInt16`, `readBuffered`, …) funnels through them via the protocol's default implementations —

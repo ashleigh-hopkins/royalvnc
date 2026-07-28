@@ -74,20 +74,39 @@ public extension VNCConnection {
 		/// `false`; connect-time only. A one-shot watchdog reverts to polling if no frames arrive.
 		public let useOptimisticContinuousUpdates: Bool
 
-		/// Opt-in to the Apple High-Performance control path (HP-SPECS §2, Q1). Default `false`.
-		///
-		/// When `false` (the default) the client is byte-for-byte identical to the standard RFB path:
-		/// the `RFB 003.889` banner is never sent, Apple security type 33 is never selected even if the
-		/// server offers it, and the connection object is a bare `NetworkConnection` (no record-layer
-		/// decorator). When `true` against an Apple Remote Desktop host, the client sends `003.889`,
-		/// selects type 33 (RSA-SRP), and arms the AES-128-CBC control record layer after the `0x44f`
-		/// rekey. Auto-detect is deliberately rejected (it would regress standard servers that offer
-		/// `003.889` or type-33-over-TLS). Connect-time only.
-		public let enableHighPerformance: Bool
+		/// The session's authentication + pixel-transport tier (SPECS §1/§3.1). Replaces the former
+		/// `enableHighPerformance: Bool` (Q1 DECIDED, removed with no shim — SPECS §3.3): a boolean pair
+		/// would permit an invalid `standardRFB`-with-Apple-auth state, whereas exactly three tiers are
+		/// meaningful. Default `.standardRFB`, byte-for-byte identical to the pre-existing behaviour: the
+		/// `RFB 003.889` banner is never sent, Apple security type 33 is never selected even if the server
+		/// offers it, and the connection object is a bare `NetworkConnection` (no record-layer decorator).
+		/// `.appleStandardFramebuffer` and `.appleHighPerformanceMedia` both authenticate as type 33
+		/// (RSA-SRP) and arm the AES-128-CBC control record layer after the `0x44f` rekey; only the latter
+		/// additionally negotiates the `0x1c` UDP/SRTP media offer (see `usesAppleControlChannel` /
+		/// `negotiatesHighPerformanceMedia` below). Auto-detect is deliberately rejected (it would regress
+		/// standard servers that offer `003.889` or type-33-over-TLS). Swift-only (no `@objc` mirror — the
+		/// `@objc` convenience init never exposed HP fields either, NFR-COMPAT). Connect-time only.
+		public let mode: SessionMode
 
-		/// Requested Apple-HP **virtual-display** geometry, sent as the `0x1d` SetDisplayConfiguration during
-		/// the HP plaintext prelude. `nil` (the default) sends nothing: byte-for-byte today's behaviour, where
-		/// the daemon streams the host's PHYSICAL display and the host screen keeps mirroring the session.
+		/// WHEN `true`, this session authenticates as Apple Remote Desktop (type 33) and arms the
+		/// AES-128-CBC record layer — true for BOTH Apple tiers (`.appleStandardFramebuffer` AND
+		/// `.appleHighPerformanceMedia`). `false` only for `.standardRFB`.
+		var usesAppleControlChannel: Bool { mode != .standardRFB }
+
+		/// WHEN `true`, this session additionally negotiates the `0x1c` UDP/SRTP HEVC media offer — true
+		/// only for `.appleHighPerformanceMedia`.
+		var negotiatesHighPerformanceMedia: Bool { mode == .appleHighPerformanceMedia }
+
+		/// Requested Apple **virtual-display** geometry, sent as the `0x1d` SetDisplayConfiguration during
+		/// the shared Apple plaintext prelude (`armAppleRecordLayer()`). `nil` (the default) sends nothing:
+		/// byte-for-byte the pre-existing behaviour, where the daemon streams the host's PHYSICAL display
+		/// and the host screen keeps mirroring the session. This is shared by BOTH Apple tiers (SPECS
+		/// §6/§9.1, B2): `.appleHighPerformanceMedia` uses it to bound HEVC decode cost;
+		/// `.appleStandardFramebuffer` uses the SAME request to size its RFB-rect canvas (fps there is
+		/// `pixel_rate / canvas_area`, so a smaller requested canvas is the dominant lever for clearing
+		/// 30 fps — SPECS NFR-FPS). `nil` is the NORMAL, shipped-default case for both tiers (G1: no
+		/// tier-specific default, no first-run prompt) — sizing then falls back to `ServerInit` (or, for
+		/// HP, the negotiated media canvas).
 		///
 		/// Non-nil asks `screensharingd` to create a SkyLight virtual display of that size and encode it
 		/// instead — the mechanism Apple's own client uses so it never has to decode a huge panel. This is the
@@ -97,7 +116,7 @@ public extension VNCConnection {
 		/// ⚠️ Setting this **curtains the host**: the Mac's physical screen stops showing the desktop for the
 		/// session, and creating a differently-shaped display reflows the user's windows (persisting after
 		/// disconnect). Therefore it must remain explicitly opt-in, never a silent default. Ignored unless
-		/// `enableHighPerformance` is `true`. Connect-time only.
+		/// `usesAppleControlChannel` is `true`. Connect-time only.
 		public let highPerformanceDisplay: HighPerformanceDisplay?
 
 		/// Bitrate to request from the host over RTCP **TMMBR** (RFC 5104), in bits per second. `0` disables
@@ -108,7 +127,7 @@ public extension VNCConnection {
 		/// virtual display spreads the same bits over more pixels and the picture goes blocky, worst of all
 		/// when zoomed. The client has never expressed a bandwidth preference (RR/SR/FIR/PLI/NACK say nothing
 		/// about it), so if AVConference sizes its encoder from receiver-side signalling it has never heard
-		/// from us. Ignored unless `enableHighPerformance` is `true`.
+		/// from us. Ignored unless `negotiatesHighPerformanceMedia` is `true`.
 		///
 		/// **RESULT: screensharingd IGNORES TMMBR — measured, so this now defaults to 0 (off).** Live probe
 		/// on macOS 27: 60 Mbps requested every 2 s for ~78 s while `pktsPerAU` stayed flat at 1.3–2.6 with no
@@ -152,7 +171,7 @@ public extension VNCConnection {
 					compressionLevel: CompressionLevel = .default,
 					useContinuousUpdates: Bool = false,
 					useOptimisticContinuousUpdates: Bool = false,
-					enableHighPerformance: Bool = false,
+					mode: SessionMode = .standardRFB,
 					highPerformanceDisplay: HighPerformanceDisplay? = nil,
 					highPerformanceRequestedBitrate: UInt64 = Settings.defaultRequestedBitrate,
 					highPerformanceMinBandwidthTier: UInt64 = 0) {
@@ -177,7 +196,7 @@ public extension VNCConnection {
 			self.compressionLevel = compressionLevel
 			self.useContinuousUpdates = useContinuousUpdates
 			self.useOptimisticContinuousUpdates = useOptimisticContinuousUpdates
-			self.enableHighPerformance = enableHighPerformance
+			self.mode = mode
 			self.highPerformanceDisplay = highPerformanceDisplay
 			self.highPerformanceRequestedBitrate = highPerformanceRequestedBitrate
 			self.highPerformanceMinBandwidthTier = highPerformanceMinBandwidthTier
@@ -213,6 +232,25 @@ public extension VNCConnection {
 					  colorDepth: colorDepth,
 					  frameEncodings: frameEncodingsSwift)
 		}
+	}
+}
+
+public extension VNCConnection.Settings {
+	/// The session's authentication + pixel-transport tier (SPECS §1/§3.1). Swift-only — no `@objc`
+	/// mirror, matching `mode`'s own doc comment (NFR-COMPAT).
+	enum SessionMode: Sendable, Equatable {
+		/// RFB 3.8 (or the Apple-DH type-30 handshake over RFB 3.8), plaintext. The pre-existing,
+		/// default tier — unaffected by this enum's introduction (AC-5).
+		case standardRFB
+
+		/// `003.889` + Apple security type 33 (RSA-SRP) + AES-128-CBC record layer, but NO `0x1c` UDP
+		/// media offer: classic RFB rects (ZRLE/Zlib) pushed continuously via AutoFrameBufferUpdate.
+		case appleStandardFramebuffer
+
+		/// `003.889` + Apple security type 33 (RSA-SRP) + AES-128-CBC record layer + the `0x1c` UDP/SRTP
+		/// HEVC media offer. The pre-existing High-Performance tier — unaffected by this enum's
+		/// introduction beyond the mechanical `enableHighPerformance` → `mode` rename (AC-5).
+		case appleHighPerformanceMedia
 	}
 }
 

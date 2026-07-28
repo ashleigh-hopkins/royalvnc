@@ -9,7 +9,7 @@ import Foundation
 // Wires `AppleClipboardCodec` onto the live record-layer connection. All four messages ride the
 // transparent AES-128-CBC control channel as ordinary RFB messages (the record layer seals each
 // `write` / decrypts each `read`), so this only deals in plaintext bytes. HP-gated: nothing here
-// fires unless `Settings.enableHighPerformance` is on (the only mode in which the record layer is
+// fires unless `Settings.usesAppleControlChannel` is on (the only case in which the record layer is
 // active and the daemon speaks these messages). See `AppleClipboardCodec` +
 // `plans/t12-clipboard-perf/T12-EXP1-GOLDEN-FINDINGS.md`.
 
@@ -33,7 +33,7 @@ extension VNCConnection {
     /// `0x15` the daemon never pushes clipboard, and the prime fetch seeds the phone with the Mac's
     /// current pasteboard.
     func enqueueAppleClipboardBringUpIfNeeded() {
-        guard settings.enableHighPerformance,
+        guard settings.usesAppleControlChannel,
               settings.isClipboardRedirectionEnabled else { return }
 
         logger.logDebug("Apple clipboard: enabling autopasteboard (0x15) + prime fetch (0x0b)")

@@ -35,10 +35,10 @@ private extension VNCConnection {
 			let clientProtocolVersion: VNCProtocol.ProtocolVersion
 			let maxSupportedProtocolVersion = maxSupportedProtocolVersion
 
-			// HP-SPECS §5.1: HP-gated 003.889 banner. Only when the HP setting is ON *and* the server
-			// is an Apple Remote Desktop host (minor == 889). Otherwise the standard downgrade path
-			// below runs unchanged (AC-5).
-			if settings.enableHighPerformance,
+			// HP-SPECS §5.1 / SPECS §3.2: Apple-gated 003.889 banner. Only when this session authenticates
+			// as Apple (either Apple tier) *and* the server is an Apple Remote Desktop host (minor ==
+			// 889). Otherwise the standard downgrade path below runs unchanged (AC-5).
+			if settings.usesAppleControlChannel,
 			   serverProtocolVersion.isAppleRemoteDesktop {
 				clientProtocolVersion = .appleRemoteDesktop
 			}
@@ -110,10 +110,11 @@ private extension VNCConnection {
 
 		let supportedSecurityTypes = supportedTypes.securityTypes
 
-		// HP-SPECS §5.2 / §4.3: HP-gated Apple type-33 (RSA-SRP) selection, taking priority when the
-		// HP setting is ON and the server offers it. When HP is OFF, type 33 is ignored entirely even
-		// if offered (AC-5) and the standard selection below runs unchanged.
-		if settings.enableHighPerformance,
+		// HP-SPECS §5.2 / §4.3 / SPECS §3.2: Apple-gated type-33 (RSA-SRP) selection, taking priority when
+		// this session authenticates as Apple (either Apple tier) and the server offers it. When neither
+		// Apple tier is selected, type 33 is ignored entirely even if offered (AC-5) and the standard
+		// selection below runs unchanged.
+		if settings.usesAppleControlChannel,
 		   supportedSecurityTypes.contains(.apple33) {
 			chosenSecurityType = .apple33
 		} else if supportedSecurityTypes.contains(.none) {
@@ -144,7 +145,7 @@ private extension VNCConnection {
 		// write). Sending 0x21 as a separate write here — as the standard path does — makes the daemon
 		// tear the TCP right after the RSA1 init. So for apple33 the coordinator emits the combined
 		// selector+init blob; we skip the standalone selector send.
-		if !(settings.enableHighPerformance && securityType == .apple33) {
+		if !(settings.usesAppleControlChannel && securityType == .apple33) {
 			do {
 				try await VNCProtocol.SecurityTypes.send(connection: connection,
 														 securityType: securityType.rawValue)
@@ -262,9 +263,10 @@ private extension VNCConnection {
 		let isShared = settings.isShared
 
 		do {
-			if settings.enableHighPerformance {
+			if settings.usesAppleControlChannel {
 				// HP-SPECS §4.3 step 4 / dossier §3.1: Apple's ClientInit is the single byte 0xC1.
-				// ORACLE(O6.5): confirmed byte-exact at the live cleartext-prelude checkpoint.
+				// ORACLE(O6.5): confirmed byte-exact at the live cleartext-prelude checkpoint. Both Apple
+				// tiers share this (SPECS §3.2).
 				try await connection.write(value: 0xC1)
 			} else {
 				try await VNCProtocol.ClientInit.send(connection: connection,
@@ -284,8 +286,9 @@ private extension VNCConnection {
 		let serverInit: VNCProtocol.ServerInit
 
 		do {
-			if settings.enableHighPerformance {
-				// HP: Apple's ServerInit name may not be valid UTF-8 — read leniently, discard the name.
+			if settings.usesAppleControlChannel {
+				// Apple: Apple's ServerInit name may not be valid UTF-8 — read leniently, discard the
+				// name. Both Apple tiers share this (SPECS §3.2).
 				serverInit = try await receiveAppleServerInit()
 			} else {
 				serverInit = try await VNCProtocol.ServerInit.receive(connection: connection,
@@ -315,12 +318,17 @@ private extension VNCConnection {
 		state.serverPixelFormat = serverPixelFormat
 		state.pixelFormat = clientPixelFormat
 
-		if settings.enableHighPerformance {
+		if settings.negotiatesHighPerformanceMedia {
 			// HP path: instead of the cleartext SetPixelFormat/SetEncodings, run the HP control
 			// bring-up (cleartext prelude → 0x44f rekey → arm the AES-128-CBC record layer). After
 			// this returns the record layer is active; the encrypted preface + framebuffer traffic is
 			// the immediate live continuation (HP-SPECS §4.3 steps 5-7).
 			try await performHighPerformanceControlBringUp()
+		} else if settings.usesAppleControlChannel {
+			// Apple-Standard tier (SPECS §4.1): reuse the SAME prelude→rekey→arm sequence via
+			// `armAppleRecordLayer()` (no `0x1c` media offer), then diverge into a decodable classic-RFB
+			// bring-up instead of the media negotiation.
+			try await performAppleStandardControlBringUp()
 		} else {
 			do {
 				try await sendSetPixelFormat(clientPixelFormat)
@@ -352,13 +360,29 @@ private extension VNCConnection {
 		// by the same ratio. Note we cannot `recreateFramebuffer` after negotiating, because negotiation runs
 		// INSIDE the bring-up call above and the framebuffer does not exist yet — so create it at the right
 		// size in the first place.
-		if settings.enableHighPerformance,
+		if settings.negotiatesHighPerformanceMedia,
 		   let canvas = appleHPMediaContext?.canvas,
 		   canvas.isReady,
 		   canvas.width <= UInt32(UInt16.max), canvas.height <= UInt32(UInt16.max),
 		   canvas.width != UInt32(framebufferSize.width) || canvas.height != UInt32(framebufferSize.height) {
 			logger.logDebug("[hp-geom] framebuffer sized from the VIDEO CANVAS \(canvas.width)x\(canvas.height) instead of ServerInit \(framebufferSize.width)x\(framebufferSize.height) (virtual display active)")
 			framebufferSize = VNCSize(width: UInt16(canvas.width), height: UInt16(canvas.height))
+		} else if settings.usesAppleControlChannel {
+			// Apple-Standard tier (SPECS §6, G1-corrected 3-way rule): this tier never negotiates `0x1c`,
+			// so there is no media canvas — size from the requested `0x1d` virtual-display backing when
+			// the user selected one, else ServerInit. `highPerformanceDisplay == nil` is the NORMAL,
+			// shipped-default case (the shared `HPDisplayPreferences` default is `.hostDisplay`) — NOT an
+			// error state and NOT something this tier defaults away from; do not hardcode a canvas here.
+			let resolved = AppleStandardBringUp.resolveCanvasSize(
+				requestedBackingWidth: settings.highPerformanceDisplay?.pixelWidth,
+				requestedBackingHeight: settings.highPerformanceDisplay?.pixelHeight,
+				serverInit: (width: framebufferSize.width, height: framebufferSize.height))
+
+			if resolved.width != framebufferSize.width || resolved.height != framebufferSize.height {
+				logger.logDebug("[apple-std] framebuffer sized from the requested 0x1d backing \(resolved.width)x\(resolved.height) instead of ServerInit \(framebufferSize.width)x\(framebufferSize.height)")
+			}
+
+			framebufferSize = VNCSize(width: resolved.width, height: resolved.height)
 		}
 
         let newFramebuffer = try VNCFramebuffer(logger: logger,
@@ -409,17 +433,32 @@ private extension VNCConnection {
 		logger.logDebug("Apple RSA-SRP authentication succeeded (SecurityResult == 0)")
 	}
 
-	/// The HP control bring-up after `ServerInit` (HP-SPECS §4.3 steps 5-7 + §14 live corrections):
-	/// plaintext prelude → receive the `1103` rekey as a rect inside a plaintext `FramebufferUpdate`
-	/// (0x00) → unwrap → send the plaintext `PostEncryptionToggle` → arm the AES-128-CBC record layer →
-	/// exercise one encrypted round-trip (proves `seal()`/`open()` live). Byte layouts are the
-	/// live-confirmed values from `agents/TEMP/hp-phase3/post-auth-crib.md`.
+	/// The Apple HP hardcoded SetEncodings blob (HP-SPECS §4.3 / crib §2b.1), sent BOTH plaintext (inside
+	/// `armAppleRecordLayer()`) and again encrypted immediately after the record layer arms (HP's own
+	/// media bring-up, `performHighPerformanceControlBringUp()`). Hoisted to a shared constant (SPECS
+	/// §4.2 DRY) instead of two independent copies of the same 56 bytes.
+	static let hpSetEncodingsBlob: [UInt8] = [
+		0x02,0x00,0x00,0x0d,
+		0x00,0x00,0x03,0xf2, 0x00,0x00,0x03,0xf3, 0x00,0x00,0x03,0xea,
+		0x00,0x00,0x00,0x06, 0x00,0x00,0x00,0x10, 0x00,0x00,0x04,0x50,
+		0x00,0x00,0x04,0x4c, 0xff,0xff,0xff,0x21, 0x00,0x00,0x04,0x4d,
+		0x00,0x00,0x04,0x51, 0x00,0x00,0x04,0x53, 0x00,0x00,0x04,0x55,
+		0x00,0x00,0x04,0x56
+	]
+
+	/// The shared Apple prelude→rekey→arm sequence (SPECS §4.2): plaintext ViewerInfo+0x12 (+ the OPT-IN
+	/// `0x1d` virtual-display request, when `settings.highPerformanceDisplay` is set) + the hardcoded
+	/// `hpSetEncodingsBlob` → receive the `1103` rekey as a rect inside a plaintext `FramebufferUpdate`
+	/// (crib §3) → unwrap → send the plaintext `PostEncryptionToggle` → arm the AES-128-CBC record layer.
+	/// Byte layouts are the live-confirmed values from `agents/TEMP/hp-phase3/post-auth-crib.md`.
 	///
-	/// NOTE (AC-2): a still-bitmap framebuffer is NOT obtainable here — Apple HP delivers every pixel
-	/// over UDP/SRTP HEVC armed by the encrypted `0x1c` media offer (Phase 4). The TCP record layer only
-	/// carries control + pseudo-encodings. This bring-up therefore proves the control channel end-to-end
-	/// (record layer armed + encrypted round-trip), which is the achievable Phase-3 milestone.
-	func performHighPerformanceControlBringUp() async throws {
+	/// Used VERBATIM by BOTH `performHighPerformanceControlBringUp()` (which continues into the `0x1c`
+	/// media offer) and `performAppleStandardControlBringUp()` (which diverges instead into a decodable
+	/// classic-RFB bring-up, SPECS §4.1). This is the ONE authority for "how the type-33 record layer gets
+	/// armed" — no duplicated prelude bytes or arm logic (SPECS §4.2). The `0x1d` request, in particular,
+	/// is what gives the Apple-Standard tier its canvas lever "for free at the wire level" (B2): it sits
+	/// entirely inside this shared block, unconditionally reachable by both tiers.
+	func armAppleRecordLayer() async throws {
 		guard let wrapKey = appleHPWrapKey else {
 			// Arm requires the wrap key from a completed RSA-SRP auth.
 			throw VNCError.authentication(.ardAuthenticationFailed)
@@ -435,20 +474,9 @@ private extension VNCConnection {
 			0x00,0x00,
 			0x12,0x00,0x00,0x01,0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x01
 		]
-		// SetEncodings (0x02, 56B): count=13, HP_ENCODINGS_FULL. SetDisplayConfiguration 0x1d is sent between
-		// the ViewerInfo settle and this, but ONLY when `settings.highPerformanceDisplay` is set (it curtains
-		// the host — see below); with the default `nil` this prelude is byte-for-byte unchanged.
-		let setEncodings: [UInt8] = [
-			0x02,0x00,0x00,0x0d,
-			0x00,0x00,0x03,0xf2, 0x00,0x00,0x03,0xf3, 0x00,0x00,0x03,0xea,
-			0x00,0x00,0x00,0x06, 0x00,0x00,0x00,0x10, 0x00,0x00,0x04,0x50,
-			0x00,0x00,0x04,0x4c, 0xff,0xff,0xff,0x21, 0x00,0x00,0x04,0x4d,
-			0x00,0x00,0x04,0x51, 0x00,0x00,0x04,0x53, 0x00,0x00,0x04,0x55,
-			0x00,0x00,0x04,0x56
-		]
-		// TIMED (see the [hp-media] negotiation timings): stage durations for the whole HP bring-up, so a
-		// slow connect can be attributed from a device log instead of guessed at.
-		let bringUpStart = Date()
+		// TIMED (see the [hp-media] negotiation timings): stage durations for the shared arm sequence, so
+		// a slow connect can be attributed from a device log instead of guessed at.
+		let armStart = Date()
 
 		do {
 			try await connection.write(data: Data(viewerInfoPlus12))
@@ -461,9 +489,9 @@ private extension VNCConnection {
 			// Why: without 0x1d the daemon encodes the host's PHYSICAL panel. On a 5120×1440 ultrawide that is
 			// 7.37 Mpx of 4:4:4 per frame, which saturates the A18 hardware decoder (~4 ms/AU measured,
 			// busyFrac 1.00) and degrades into unbounded slow-motion. Asking for a smaller virtual display is
-			// how Apple's own client avoids this. Sent BEFORE the 0x1c media offer so the FIRST 0x1c answer
-			// already carries the reduced canvas (no 0x451 resize dance, no 0x1c re-offer — neither of which
-			// this fork implements).
+			// how Apple's own client avoids this. Sent BEFORE the 0x1c media offer (HP) / before the
+			// Apple-Standard bring-up's own SetEncodings (SPECS §4.1) so the canvas is already reduced with no
+			// resize dance.
 			//
 			// ⚠️ This CURTAINS the host (physical screen stops showing the desktop; window layout reflows and
 			// stays reflowed after disconnect), so it is strictly opt-in — `nil` sends nothing.
@@ -476,12 +504,12 @@ private extension VNCConnection {
 				logger.logDebug("[hp-vdisp] sent 0x1d SetDisplayConfiguration (\(sdc.count) B) backing=\(display.pixelWidth)x\(display.pixelHeight) points=\(display.logicalWidth)x\(display.logicalHeight) hidpi=\(display.hidpiScale) — HOST IS NOW CURTAINED")
 			}
 
-			try await connection.write(data: Data(setEncodings))
+			try await connection.write(data: Data(Self.hpSetEncodingsBlob))
 		} catch {
-			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send HP Prelude",
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Apple Prelude",
 																 underlyingError: error)
 		}
-		logger.logDebug("[hp] sent plaintext prelude (ViewerInfo+0x12, SetEncodings) in \(Self.hpElapsedMs(since: bringUpStart))ms")
+		logger.logDebug("[apple-arm] sent plaintext prelude (ViewerInfo+0x12, SetEncodings) in \(Self.hpElapsedMs(since: armStart))ms")
 
 		// § crib 3 — the 36-byte 1103 rekey arrives as a rect inside a plaintext FramebufferUpdate (0x00).
 		// TIMED: this read blocks until the daemon sends the rekey burst. When a `0x1d` virtual display was
@@ -491,7 +519,7 @@ private extension VNCConnection {
 		let rekeyBody: Data
 		do {
 			rekeyBody = try await readAppleRekeyBlob()
-			logger.logDebug("[hp] 1103 rekey read in \(Self.hpElapsedMs(since: rekeyStart))ms")
+			logger.logDebug("[apple-arm] 1103 rekey read in \(Self.hpElapsedMs(since: rekeyStart))ms")
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Read 1103 Rekey",
 																 underlyingError: error)
@@ -503,7 +531,7 @@ private extension VNCConnection {
 														   ivWrapped: parsed.ivWrapped),
 														  wrapKey: wrapKey)
 		guard let recordLayer = connection as? AppleRecordLayerConnection else {
-			throw VNCError.authentication(.ardAuthenticationFailed)   // decorator must be present under HP
+			throw VNCError.authentication(.ardAuthenticationFailed)   // decorator must be present under Apple auth
 		}
 
 		// § crib 3 — PostEncryptionToggle (0x12, 8B) is the LAST plaintext byte the client sends. It goes
@@ -518,8 +546,21 @@ private extension VNCConnection {
 		// Arm: both directions flip to encrypted (server already flipped right after the 1103 rect).
 		try recordLayer.activateRecordLayer(contentKey: recovered.key, iv: recovered.iv)
 		appleHPWrapKey = nil
-		logger.logDebug("[hp] AES-128-CBC record layer ARMED (generation \(parsed.gen))")
+		logger.logDebug("[apple-arm] AES-128-CBC record layer ARMED (generation \(parsed.gen)) in \(Self.hpElapsedMs(since: armStart))ms total")
 		try await Task.sleep(nanoseconds: 200_000_000)   // _POST_TOGGLE_SETTLE_S = 0.2s
+	}
+
+	/// The HP control bring-up after `ServerInit` (HP-SPECS §4.3 steps 5-7 + §14 live corrections): arm
+	/// the shared record layer (`armAppleRecordLayer()`), then negotiate the `0x1c` UDP/SRTP media offer.
+	///
+	/// NOTE (AC-2): a still-bitmap framebuffer is NOT obtainable here — Apple HP delivers every pixel
+	/// over UDP/SRTP HEVC armed by the encrypted `0x1c` media offer (Phase 4). The TCP record layer only
+	/// carries control + pseudo-encodings. This bring-up therefore proves the control channel end-to-end
+	/// (record layer armed + encrypted round-trip), which is the achievable Phase-3 milestone.
+	func performHighPerformanceControlBringUp() async throws {
+		let bringUpStart = Date()
+
+		try await armAppleRecordLayer()
 
 		// Phase-4 media negotiation over the armed record layer (crib §2b): SetEncodings 0x02 →
 		// 0x1c offer → FBU-req 0x03 → read the answer canvas → 0x09. This REPLACES the old 1-byte
@@ -528,7 +569,7 @@ private extension VNCConnection {
 		// path drives its own reads via open() and does NOT fall into the standard framebuffer decode
 		// loop (which can't handle Apple HP pseudo-encodings like 0x451).
 		do {
-			try await connection.write(data: Data(setEncodings))   // SetEncodings 0x02 (crib §2b.1)
+			try await connection.write(data: Data(Self.hpSetEncodingsBlob))   // SetEncodings 0x02 (crib §2b.1)
 			// UNIFIED (crib §7): always negotiate media (0x1c/UDP), then the record-framed Apple control
 			// loop (started in connectionDidBecomeReady) carries cursor/layout/clipboard on TCP alongside
 			// the UDP media stream. The old media-vs-clipboard gate is gone: the control loop now survives
@@ -542,6 +583,82 @@ private extension VNCConnection {
 		}
 
 		logger.logDebug("[hp] bring-up total: \(Self.hpElapsedMs(since: bringUpStart))ms (prelude → rekey → arm → media canvas)")
+	}
+
+	/// The Apple-Standard (non-HP, no `0x1c` media) bring-up after `ServerInit` (SPECS §4.1): arm the
+	/// shared record layer (`armAppleRecordLayer()` — includes the `0x1d` canvas request when one was
+	/// made), then DIVERGE from HP: `SetPixelFormat` (24-bit BGRA — ASSUMPTION A1/Q2, matches the
+	/// standard path's cleartext default), `SetEncodings` with a decodable whitelisted primary FIRST
+	/// (SPECS §7 — `AppleStandardBringUp.setEncodingsOrder`, ZRLE(16) default), AutoFrameBufferUpdate with
+	/// continuous push ON (`wire[4..7]=0x00000000` — SPECS §4.4/FR-4, the T14 "Change B" fix; this is the
+	/// ONLY per-viewer continuous-delivery mechanism this tier uses — it never negotiates media and never
+	/// uses RFB Continuous Updates), then exactly ONE non-incremental `FramebufferUpdateRequest`. After
+	/// this returns, AutoFBU is the sole push mechanism — `connectionDidBecomeReady()` and
+	/// `VNCConnection+Send.swift`'s zero-arg `sendFramebufferUpdateRequest()` both know not to send another
+	/// request for this tier (no steady-state polling; SPECS §4.4 — erroneous steady-state requesting is
+	/// the device-confirmed stall documented as fork note #6 / "Change B").
+	func performAppleStandardControlBringUp() async throws {
+		let bringUpStart = Date()
+
+		try await armAppleRecordLayer()
+
+		do {
+			try await sendSetPixelFormat(VNCProtocol.PixelFormat(depth: settings.colorDepth.rawValue))
+		} catch {
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Apple-Standard Set Pixel Format",
+																 underlyingError: error)
+		}
+
+		// Q4 DECIDED: ZRLE(16) is the default primary; Zlib(6) is a connect-time alternative (not wired to
+		// a Settings knob in Phase 1 — SPECS §7 forbids a LIVE change, but a future connect-time choice is
+		// just a different `primary` argument here). Order matches the probe's own live-verified
+		// configuration exactly (probe §Method Config A) — do not reorder ad hoc.
+		let primary = AppleStandardBringUp.zrle
+		let setEncodingsOrder = AppleStandardBringUp.setEncodingsOrder(primary: primary)
+			.map { VNCEncodingType(Int32($0)) }
+
+		do {
+			try await sendSetEncodings(setEncodingsOrder)
+		} catch {
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Apple-Standard Set Encodings",
+																 underlyingError: error)
+		}
+
+		// SPECS §6 (G1-corrected 3-way rule, applied here identically to the later framebuffer-sizing
+		// site at `receiveServerInit`): no media canvas on this tier — the requested `0x1d` backing when
+		// one was made, else ServerInit (`state.framebufferWidth/Height`, already set by `receiveServerInit`
+		// before this bring-up runs). `highPerformanceDisplay == nil` is the NORMAL default case.
+		let canvas = AppleStandardBringUp.resolveCanvasSize(
+			requestedBackingWidth: settings.highPerformanceDisplay?.pixelWidth,
+			requestedBackingHeight: settings.highPerformanceDisplay?.pixelHeight,
+			serverInit: (width: state.framebufferWidth, height: state.framebufferHeight))
+
+		let autoFBUBytes = AppleStandardBringUp.autoFBUBytes(continuous: true,
+															 width: canvas.width,
+															 height: canvas.height)
+		do {
+			try await connection.write(data: Data(autoFBUBytes))
+		} catch {
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Apple-Standard AutoFBU",
+																 underlyingError: error)
+		}
+		logger.logDebug("[apple-std] sent AutoFrameBufferUpdate 0x09 continuous=ON at \(canvas.width)x\(canvas.height)")
+
+		// Exactly ONE non-incremental FramebufferUpdateRequest (SPECS §4.1 step 4). Sentinel full-screen
+		// dims (0xFFFF), matching the probe's own live-verified request byte-for-byte (probe §Method) —
+		// not the actual canvas size, which the daemon does not require here. After this, AutoFBU is the
+		// sole push mechanism (SPECS §4.4/FR-4) — no further requests are sent by this tier.
+		do {
+			let initialRequest = VNCProtocol.FramebufferUpdateRequest(incremental: false,
+																	  xPosition: 0, yPosition: 0,
+																	  width: 0xFFFF, height: 0xFFFF)
+			try await initialRequest.send(connection: connection)
+		} catch {
+			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Apple-Standard initial FBU request",
+																 underlyingError: error)
+		}
+
+		logger.logDebug("[apple-std] bring-up total: \(Self.hpElapsedMs(since: bringUpStart))ms (prelude → rekey → arm → primary=\(primary) canvas=\(canvas.width)x\(canvas.height))")
 	}
 
 	/// Read the 36-byte `1103` rekey blob, which Apple delivers as a rect inside a plaintext

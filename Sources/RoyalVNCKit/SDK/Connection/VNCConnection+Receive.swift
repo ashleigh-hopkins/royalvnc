@@ -57,12 +57,38 @@ private extension VNCConnection {
 			case VNCProtocol.EndOfContinuousUpdates.messageType:
 				try await handleEndOfContinuousUpdatesMessage()
 
-			// NOTE: Apple in-protocol clipboard (0x14/0x1f) is handled by the HP record-framed control
-			// loop (VNCConnection+AppleControl), not this standard loop — the HP path never runs it.
+			// Apple-Standard tier (SPECS §5.3, FR-6): `0x14` MiscStatus can arrive interleaved with
+			// classic ZRLE/Zlib rects on this tier's STANDARD receive loop (the HP tier never reaches this
+			// case — it runs the separate record-framed control loop instead, VNCConnection+AppleControl).
+			// Reuses the SAME handler the HP control loop already has (`handleAppleControlMiscStatus`) —
+			// same 8-byte message shape, same reaction (fetch on cmd=2, no-op otherwise; a no-op in Phase 1
+			// since this tier's `isClipboardRedirectionEnabled` is false — SPECS §5.3).
+			case AppleClipboardCodec.msgMiscStatus where settings.usesAppleControlChannel:
+				try await handleStandardLoopMiscStatusMessage()
+
+			// NOTE: `0x1f` ClipboardSend cannot arrive here — the Apple-Standard tier's outbound `0x1f`
+			// is gated on `isClipboardRedirectionEnabled` (VNCConnection+API.swift, SPECS §3.2/§5.3), so
+			// this tier never primes the daemon to send one (AC-6).
 
 			default:
+				// FR-7/SPECS §5.4: a genuinely-unknown message type cannot be skipped without desyncing the
+				// byte stream, so this MUST stay fatal — but log the id first so the failure is diagnosable
+				// instead of an opaque disconnect.
+				logger.logError("Unsupported server-to-client message type=\(messageType) (0x\(String(messageType, radix: 16))) — failing the connection (cannot skip an unknown-length message without desyncing)")
 				throw VNCError.protocol(.unsupportedServerToClientMessage(messageType: messageType))
 		}
+	}
+
+	/// `0x14` MiscStatus read off the STANDARD receive loop (SPECS §5.3). The switch in `didReceive`
+	/// already consumed the type byte via `ServerToClientMessage.receive`; this reads the fixed remaining
+	/// 7 bytes (total message = 8 B, confirmed by probe measurement — NOT length-prefixed, so there is no
+	/// framing-authority call here) and reconstructs the full message `Data` the shared Apple handler
+	/// expects.
+	func handleStandardLoopMiscStatusMessage() async throws {
+		var message = Data([AppleClipboardCodec.msgMiscStatus])
+		message.append(try await connection.readBuffered(length: 7))
+
+		handleAppleControlMiscStatus(message)
 	}
 
 	func handleFramebufferUpdateMessage() async throws {

@@ -13,7 +13,7 @@ import CoreVideo
 /// §4.3 / crib §2b). Runs immediately after `performHighPerformanceControlBringUp` arms the record
 /// layer: sends the `0x1c` MediaStreamConfiguration offer, reads the `0x1c` answer (a standard
 /// FramebufferUpdate carrying an embedded bplist), and parses the negotiated canvas. HP-gated;
-/// only reached on the `enableHighPerformance` path.
+/// only reached on the `negotiatesHighPerformanceMedia` path.
 ///
 /// SRTP/UDP media receive is a follow-on step (needs a bound local 5900/5901 which collides with
 /// the daemon's own ports on a loopback host — validated from a separate client host). The four

@@ -119,7 +119,12 @@ extension VNCConnection {
     /// render path (`framebuffer.updateCursor` → `didUpdateCursor` delegate). A cache-hit
     /// (`comp_size == 0`) re-applies the cached shape, or reverts to the OS default on an unknown
     /// `cache_id` (reference behavior). A decode failure is logged and skipped — never fatal.
-    private func applyAppleCursor(_ rect: AppleControlChannelCodec.CursorRect) {
+    ///
+    /// Internal (not `private`): reused by the Apple-Standard tier's `AppleCursorPseudoEncoding`
+    /// (`AppleStandardPseudoEncodings.swift`), which decodes the SAME `1104` rect shape off the standard
+    /// receive loop and shares this connection's cursor cache rather than keeping a second one (SPECS
+    /// §5.2 — "decode → existing framebuffer.updateCursor, reuse applyAppleCursor").
+    func applyAppleCursor(_ rect: AppleControlChannelCodec.CursorRect) {
         guard let framebuffer else { return }   // HP framebuffer exists once ServerInit lands
 
         if rect.isCacheHit {
@@ -195,7 +200,11 @@ extension VNCConnection {
 
     /// `0x14` MiscStatus (crib §7a). On `cmd=2` (remote clipboard changed) reply with a `0x0b` fetch;
     /// other commands (incl. the macOS-27 heartbeat) are ignored.
-    private func handleAppleControlMiscStatus(_ message: Data) {
+    ///
+    /// Internal (not `private`): reused verbatim by the Apple-Standard tier's `0x14` handling on the
+    /// STANDARD receive loop (`VNCConnection+Receive.swift`, SPECS §5.3) — same message shape (8 B),
+    /// same reaction, different loop. No re-derived logic.
+    func handleAppleControlMiscStatus(_ message: Data) {
         guard AppleClipboardCodec.isRemoteClipboardChanged(message) else { return }
         guard settings.isClipboardRedirectionEnabled else { return }
         logger.logDebug("[hp-ctl] remote clipboard changed (0x14 cmd=2) — fetching (0x0b)")
@@ -225,7 +234,7 @@ extension VNCConnection {
 
         appleClipboardReassembly = nil
 
-        guard settings.enableHighPerformance, settings.isClipboardRedirectionEnabled else { return }
+        guard settings.usesAppleControlChannel, settings.isClipboardRedirectionEnabled else { return }
 
         // A decode failure (corrupt/truncated zlib, uncompressed-size mismatch) MUST NOT tear down the
         // session — the daemon can emit such payloads and the reference logs+continues. Swallow and

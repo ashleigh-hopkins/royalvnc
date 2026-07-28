@@ -146,7 +146,7 @@ extension VNCProtocol.ProtocolVersion {
 	}
 
 	/// The Apple Remote Desktop High-Performance banner, `RFB 003.889` (HP-SPECS §5.1). Emitted ONLY
-	/// on the HP-gated handshake branch (`Settings.enableHighPerformance` on and the server offered
+	/// on the Apple-gated handshake branch (`Settings.usesAppleControlChannel` on and the server offered
 	/// `003.889`); the standard path never constructs or sends it.
 	static var appleRemoteDesktop: Self {
 		.init(majorVersion: 3,

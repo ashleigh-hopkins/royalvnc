@@ -199,14 +199,22 @@ enum AppleControlChannelCodec {
 
     /// `1104` cursor body: `u32 cache_id, u32 comp_size`, then `comp_size` bytes when nonzero (crib §7b).
     /// `comp_size == 0` is a cache-hit (body = 8). Returns `nil` if the fixed 8-byte prefix is truncated.
-    private static func cursorBodyLength(_ b: [UInt8], _ offset: Int) -> Int? {
+    ///
+    /// Internal (not `private`): this is the SINGLE framing authority for the `1104` body length. The
+    /// Apple-Standard tier's streaming pseudo-encoding adapter (`AppleStandardPseudoEncodings.swift`)
+    /// calls this on an 8-byte prefix it has already read off the live connection, rather than
+    /// re-deriving "8 + comp_size" itself (SPECS §5.2 — one authority, no duplicated framing).
+    static func cursorBodyLength(_ b: [UInt8], _ offset: Int) -> Int? {
         guard offset + 8 <= b.count else { return nil }
         let compSize = Int(readU32(b, offset + 4))
         return 8 + compSize
     }
 
     /// Length-prefixed config body: `u16 size + size bytes` → consumed `2 + size` (crib §7b).
-    private static func lengthPrefixedBodyLength(_ b: [UInt8], _ offset: Int) -> Int? {
+    ///
+    /// Internal (not `private`): same rationale as `cursorBodyLength` above, for the
+    /// `{1010,1011,1107,1109,1110}` skip-only config set.
+    static func lengthPrefixedBodyLength(_ b: [UInt8], _ offset: Int) -> Int? {
         guard offset + 2 <= b.count else { return nil }
         return 2 + readU16(b, offset)
     }

@@ -122,7 +122,7 @@ public final class VNCConnection: NSObjectOrAnyObject {
 #endif
 
         let connection: any NetworkConnection
-        if settings.enableHighPerformance {
+        if settings.usesAppleControlChannel {
             // Wrap in passthrough mode at creation; the handshake flips it to CBC after the 0x44f rekey.
             connection = AppleRecordLayerConnection(base: base)
         } else {
@@ -202,9 +202,31 @@ public final class VNCConnection: NSObjectOrAnyObject {
 		]
 
 		// NOTE (HP): Apple's control-channel pseudo-encodings (cursor 1104, display-layout 0x451, config
-		// blobs) are NOT registered here — the HP path does not run the standard framebuffer decoder.
-		// They are parsed in-memory, record-framed, by `VNCConnection+AppleControl` (crib §7), which is
-		// the only way to survive unknown-length Apple encodings without desyncing.
+		// blobs) are NOT registered here for the HP tier — the HP path does not run the standard
+		// framebuffer decoder at all; they are parsed in-memory, record-framed, by
+		// `VNCConnection+AppleControl` (crib §7), which is the only way to survive unknown-length Apple
+		// encodings without desyncing.
+		//
+		// Apple-Standard tier (SPECS §5.2): this tier DOES run the standard framebuffer decoder
+		// (`startReceiveLoop()`), so the SAME Apple pseudo-encodings it can still receive interleaved with
+		// classic ZRLE/Zlib rects (cursor 1104, display-layout 0x451, and the length-prefixed config set)
+		// must be registered here as tolerant `VNCReceivablePseudoEncoding`s — otherwise
+		// `FramebufferUpdate.receive` throws `.unsupportedEncoding` and tears the session down (NFR-
+		// TOLERANCE). Every adapter delegates its byte-sizing to the single framing authority,
+		// `AppleControlChannelCodec` — see `AppleStandardPseudoEncodings.swift`. Gated on
+		// `usesAppleControlChannel` so a standard (non-Apple) RFB server's behaviour is byte-for-byte
+		// unchanged (AC-5): these numeric ids are Apple-specific and a non-Apple server would never emit
+		// them, but gating keeps the registry's *reachable* encoding set identical to today's for
+		// `.standardRFB`, not just its practically-observed one.
+		if settings.usesAppleControlChannel {
+			encs[VNCEncodingType(Int32(AppleControlChannelCodec.encCursor))] = AppleCursorPseudoEncoding(owner: self)
+			encs[VNCEncodingType(Int32(AppleControlChannelCodec.encDisplayLayout))] = AppleDisplayLayoutPseudoEncoding()
+
+			for configEncoding in AppleControlChannelCodec.lengthPrefixedConfigEncodings {
+				let encodingType = VNCEncodingType(Int32(configEncoding))
+				encs[encodingType] = AppleConfigSkipPseudoEncoding(encodingType: encodingType)
+			}
+		}
 
 		// Sanity Check
 		do {
@@ -382,7 +404,7 @@ extension VNCConnection {
 	func beginConnecting() {
 		updateConnectionState(.connecting)
 
-		if settings.enableHighPerformance {
+		if settings.usesAppleControlChannel {
 			// HP-SPECS §14: run Apple's two-TCP warmup BEFORE the real session TCP. Dispatched on the
 			// connection queue so the ~1.4s dwell never blocks the caller (UI) thread; the connection
 			// isn't started until the warmup returns.
@@ -494,7 +516,7 @@ private extension VNCConnection {
 				// can't survive Apple pseudo-encodings), plus the send loop for clipboard bring-up + outbound.
 				// The background media receiver (if negotiated during the handshake) streams UDP in parallel,
 				// so ONE HP session carries media (UDP) AND control/clipboard (TCP) together.
-				if settings.enableHighPerformance {
+				if settings.negotiatesHighPerformanceMedia {
 					logger.logDebug("[hp] connected — starting Apple control loop + send loop (media receiver active: \(appleHPMediaReceiverActive))")
 					updateConnectionState(.connected)
 					startAppleControlLoop()
@@ -502,12 +524,23 @@ private extension VNCConnection {
 					return
 				}
 
-				// T1 Change A: in optimistic mode, enable Continuous Updates WITHOUT the support guard
-				// and WITHOUT an initial polling request — the enable region solicits the first frame,
-				// and a server that ignores msg 150 leaves framebufferUpdateCount at 0 so the watchdog
-				// reverts to polling. (`wantsOptimisticContinuousUpdates` is set once in init and never
-				// mutated, so this read is race-free.)
-				if state.wantsOptimisticContinuousUpdates {
+				// Apple-Standard tier (type-33 record layer, no 0x1c media — SPECS §4.1/§4.4/FR-4): the
+				// ONE allowed initial FramebufferUpdateRequest was already sent inside
+				// performAppleStandardControlBringUp() during the handshake, and AutoFrameBufferUpdate
+				// (wire[4..7]=0) is the sole push mechanism from here on. This tier never uses RFB
+				// Continuous Updates (optimistic or otherwise), so neither branch below applies to it —
+				// sending another request here would be a second, redundant one-shot on top of a daemon
+				// that is already free-running. Falls through to the standard startReceiveLoop() below
+				// (VNCConnection+Send.swift's zero-arg sendFramebufferUpdateRequest() additionally guards
+				// the STEADY-STATE half of this rule against the receive loop's own per-update re-request).
+				if settings.usesAppleControlChannel {
+					// no-op — rely on the AutoFBU push already armed by the bring-up.
+				} else if state.wantsOptimisticContinuousUpdates {
+					// T1 Change A: in optimistic mode, enable Continuous Updates WITHOUT the support guard
+					// and WITHOUT an initial polling request — the enable region solicits the first frame,
+					// and a server that ignores msg 150 leaves framebufferUpdateCount at 0 so the watchdog
+					// reverts to polling. (`wantsOptimisticContinuousUpdates` is set once in init and never
+					// mutated, so this read is race-free.)
 					try await sendOptimisticEnableContinuousUpdates()
 				} else {
 					try await sendFramebufferUpdateRequest()
