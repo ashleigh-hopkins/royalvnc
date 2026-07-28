@@ -18,6 +18,13 @@ enum AppleStandardBringUp {
     /// Zlib — the connect-time alternative primary encoding (Q4 DECIDED).
     static let zlib: Int64 = 6
 
+    /// The tier's DEFAULT primary (Q4 DECIDED: ZRLE) — the SINGLE source of truth both
+    /// `VNCConnection+Handshake.swift`'s `armAppleRecordLayer()` (plaintext-prelude SetEncodings, the
+    /// SPECS §4.2 tier-dependent fix) and `performAppleStandardControlBringUp()` (logging only, since
+    /// SetEncodings itself is now sent exactly once, in the prelude) read, so the two sites can never
+    /// drift onto different primaries from each other.
+    static let defaultPrimary: Int64 = zrle
+
     /// The two fork-decodable, `screensharingd`-whitelisted frame encodings this tier may lead with
     /// (discovery §5a: `{6,16,1000,1001,1002,1010,1011}` ∩ "has a real `VNCFrameEncoding` decoder" = `{6,16}`).
     static let decodableWhitelistedEncodings: [Int64] = [zrle, zlib]

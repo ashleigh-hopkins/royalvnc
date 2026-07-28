@@ -413,6 +413,46 @@ private extension VNCConnection {
 	}
 }
 
+// MARK: - Apple prelude SetEncodings (tier-dependent; deliberately NOT `private` — see below)
+extension VNCConnection {
+	/// Tier-dependent plaintext-prelude `SetEncodings` (0x02) wire bytes for `armAppleRecordLayer()`'s
+	/// shared prelude write (SPECS §4.2 CORRECTION — the arm sequence is no longer byte-identical for
+	/// both tiers; see the file-level note this falsifies at TYPE33-STANDARD-SPECS §4.2). Deliberately
+	/// declared in a plain (internal-default) extension rather than the `private extension` below —
+	/// `private`/`fileprivate` members cannot be raised back to `internal` from within a `private
+	/// extension` (Swift clamps any explicit modifier there) — purely so this exact byte-selection stays
+	/// unit-testable (`@testable import`) without a socket or a full RSA-SRP handshake. It is pure and
+	/// connection-free.
+	///
+	/// - HP (`negotiatesHighPerformanceMedia == true`): `hpSetEncodingsBlob` VERBATIM, unchanged. Any
+	///   diff here is a regression against HP-SPECS §4.3.
+	/// - Apple-Standard: derived from the EXISTING single source of truth
+	///   `AppleStandardBringUp.setEncodingsOrder(primary:)` (SPECS §7) — NOT a second hardcoded blob.
+	///
+	/// ⚠️ WHY TIER-DEPENDENT, NOT SHARED (do not "simplify" this back into one blob for both tiers):
+	/// `screensharingd` latches its per-session primary codec from the FIRST SetEncodings it EVER sees —
+	/// including this plaintext one, sent before the AES-128-CBC record layer even arms. HP's blob
+	/// correctly leads with `1010` (its media codec). Reusing that SAME blob for Apple-Standard was the
+	/// root cause of a device-reproduced SILENT BLANK SCREEN AT 0 FPS over a real WiFi link: the SRP
+	/// modexp + RTT (~4.2s+) gave `screensharingd` time to already latch codec 1010 from THIS prelude
+	/// before Apple-Standard's own correct, ZRLE-first SetEncodings arrived — and the daemon refused to
+	/// re-latch, so it only ever sent 1010/1107/1109/1110 config pseudo-encodings, never a single ZRLE
+	/// rect. Over Catalyst loopback the same race went the other way (no SRP network latency), which is
+	/// exactly why this was invisible there. FAILURE MODE IF REGRESSED: blank screen, 0 fps, ONLY on a
+	/// slow/high-latency link — it will look fine on loopback/localhost testing.
+	static func armSetEncodingsBytes(negotiatesHighPerformanceMedia: Bool) -> Data {
+		if negotiatesHighPerformanceMedia {
+			return Data(hpSetEncodingsBlob)
+		}
+
+		let encodingTypes = AppleStandardBringUp
+			.setEncodingsOrder(primary: AppleStandardBringUp.defaultPrimary)
+			.map { VNCEncodingType(Int32($0)) }
+
+		return VNCProtocol.SetEncodings(encodingTypes: encodingTypes).data
+	}
+}
+
 // MARK: - Apple High-Performance (type 33 + AES-128-CBC record layer)
 private extension VNCConnection {
 	/// Run the RSA-SRP (type 33) exchange via the coordinator and stash the derived record-layer wrap
@@ -447,17 +487,20 @@ private extension VNCConnection {
 	]
 
 	/// The shared Apple prelude→rekey→arm sequence (SPECS §4.2): plaintext ViewerInfo+0x12 (+ the OPT-IN
-	/// `0x1d` virtual-display request, when `settings.highPerformanceDisplay` is set) + the hardcoded
-	/// `hpSetEncodingsBlob` → receive the `1103` rekey as a rect inside a plaintext `FramebufferUpdate`
-	/// (crib §3) → unwrap → send the plaintext `PostEncryptionToggle` → arm the AES-128-CBC record layer.
-	/// Byte layouts are the live-confirmed values from `agents/TEMP/hp-phase3/post-auth-crib.md`.
+	/// `0x1d` virtual-display request, when `settings.highPerformanceDisplay` is set) + a TIER-DEPENDENT
+	/// SetEncodings (`armSetEncodingsBytes` above — NOT the same blob for both tiers anymore) → receive
+	/// the `1103` rekey as a rect inside a plaintext `FramebufferUpdate` (crib §3) → unwrap → send the
+	/// plaintext `PostEncryptionToggle` → arm the AES-128-CBC record layer. Byte layouts are the
+	/// live-confirmed values from `agents/TEMP/hp-phase3/post-auth-crib.md`.
 	///
-	/// Used VERBATIM by BOTH `performHighPerformanceControlBringUp()` (which continues into the `0x1c`
-	/// media offer) and `performAppleStandardControlBringUp()` (which diverges instead into a decodable
-	/// classic-RFB bring-up, SPECS §4.1). This is the ONE authority for "how the type-33 record layer gets
-	/// armed" — no duplicated prelude bytes or arm logic (SPECS §4.2). The `0x1d` request, in particular,
-	/// is what gives the Apple-Standard tier its canvas lever "for free at the wire level" (B2): it sits
-	/// entirely inside this shared block, unconditionally reachable by both tiers.
+	/// The ViewerInfo+0x12 / `0x1d` / rekey-read / toggle / arm steps ARE still shared VERBATIM by BOTH
+	/// `performHighPerformanceControlBringUp()` (which continues into the `0x1c` media offer) and
+	/// `performAppleStandardControlBringUp()` (which diverges instead into a decodable classic-RFB
+	/// bring-up, SPECS §4.1) — this remains the ONE authority for "how the type-33 record layer gets
+	/// armed", no duplicated arm logic. Only the trailing SetEncodings bytes now differ per tier — see
+	/// `armSetEncodingsBytes`. The `0x1d` request, in particular, is what gives the Apple-Standard tier
+	/// its canvas lever "for free at the wire level" (B2): it sits entirely inside this shared block,
+	/// unconditionally reachable by both tiers.
 	func armAppleRecordLayer() async throws {
 		guard let wrapKey = appleHPWrapKey else {
 			// Arm requires the wrap key from a completed RSA-SRP auth.
@@ -504,7 +547,7 @@ private extension VNCConnection {
 				logger.logDebug("[hp-vdisp] sent 0x1d SetDisplayConfiguration (\(sdc.count) B) backing=\(display.pixelWidth)x\(display.pixelHeight) points=\(display.logicalWidth)x\(display.logicalHeight) hidpi=\(display.hidpiScale) — HOST IS NOW CURTAINED")
 			}
 
-			try await connection.write(data: Data(Self.hpSetEncodingsBlob))
+			try await connection.write(data: Self.armSetEncodingsBytes(negotiatesHighPerformanceMedia: settings.negotiatesHighPerformanceMedia))
 		} catch {
 			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Apple Prelude",
 																 underlyingError: error)
@@ -611,18 +654,22 @@ private extension VNCConnection {
 
 		// Q4 DECIDED: ZRLE(16) is the default primary; Zlib(6) is a connect-time alternative (not wired to
 		// a Settings knob in Phase 1 — SPECS §7 forbids a LIVE change, but a future connect-time choice is
-		// just a different `primary` argument here). Order matches the probe's own live-verified
-		// configuration exactly (probe §Method Config A) — do not reorder ad hoc.
-		let primary = AppleStandardBringUp.zrle
-		let setEncodingsOrder = AppleStandardBringUp.setEncodingsOrder(primary: primary)
-			.map { VNCEncodingType(Int32($0)) }
+		// just a different `primary` argument here). Single source of truth: `AppleStandardBringUp.
+		// defaultPrimary` — the SAME value `armAppleRecordLayer()`'s plaintext prelude already sent FIRST
+		// via `armSetEncodingsBytes` (SPECS §4.2 fix), so this is logging only, not a resend.
+		let primary = AppleStandardBringUp.defaultPrimary
 
-		do {
-			try await sendSetEncodings(setEncodingsOrder)
-		} catch {
-			throw VNCError.ConnectionError.closedDuringHandshake(handshakingPhase: "Send Apple-Standard Set Encodings",
-																 underlyingError: error)
-		}
+		// NO post-arm SetEncodings send here (REMOVED — was a second, redundant send of the exact same
+		// list the plaintext prelude above already sent FIRST). `screensharingd` latches its primary
+		// codec from the FIRST SetEncodings it ever sees; that is now the plaintext one, so resending the
+		// identical list here, encrypted, changes nothing the daemon looks at. It is also exactly the
+		// shape of bug that caused this defect in the first place (a correct list arriving "too late" to
+		// matter) — keeping a redundant duplicate send here is how that class of bug recurs. The
+		// reference's own proven-live classic-push probe (`agents/TEMP/type33-standard/
+		// probe_classic_push.py`, 8,239 ZRLE rects captured) never sends SetEncodings a second time
+		// either: after its plaintext prelude it goes straight to the encrypted AutoFBU + initial
+		// FramebufferUpdateRequest. Do not re-add a post-arm SetEncodings send here without new live
+		// evidence that it changes something.
 
 		// SPECS §6 (G1-corrected 3-way rule, applied here identically to the later framebuffer-sizing
 		// site at `receiveServerInit`): no media canvas on this tier — the requested `0x1d` backing when
